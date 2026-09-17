@@ -276,7 +276,7 @@ help:
 	@echo "DS4 build targets:"
 	@echo "  make cuda-spark          Build CUDA for DGX Spark / GB10"
 	@echo "  make cuda-generic        Build CUDA for a generic local CUDA GPU"
-	@echo "  make cuda CUDA_ARCH=sm_N Build CUDA with an explicit nvcc -arch value"
+	@echo "  make cuda CUDA_ARCH=sm_N Build CUDA for a local NVIDIA GPU (arch auto-detected when omitted)"
 	@echo "  make strix-halo          Build ROCm for Strix Halo / gfx1151"
 	@echo "  make rocm                Alias for make strix-halo"
 	@echo "  make test-mxfp4-rocm     Build and run the synthetic ROCm MXFP4 MoE test"
@@ -294,12 +294,19 @@ cuda-generic:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=native
 
 cuda:
-	@if [ -z "$(strip $(CUDA_ARCH))" ]; then \
-		echo "error: specify CUDA_ARCH, for example: make cuda CUDA_ARCH=sm_120"; \
-		echo "       or use make cuda-spark / make cuda-generic"; \
-		exit 2; \
-	fi
-	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH="$(CUDA_ARCH)"
+	@set -e; \
+	arch="$(strip $(CUDA_ARCH))"; \
+	if [ -z "$$arch" ]; then \
+	  cap="$$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n1 | tr -d '[:space:].')"; \
+	  if [ -n "$$cap" ]; then \
+	    arch="sm_$$cap"; \
+	  else \
+	    arch=native; \
+	    echo "make: nvidia-smi reported no compute capability; falling back to CUDA_ARCH=native"; \
+	  fi; \
+	  echo "make: auto-detected CUDA_ARCH=$$arch"; \
+	fi; \
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH="$$arch"
 
 strix-halo:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent \
