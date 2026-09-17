@@ -188,6 +188,7 @@ static int cuda_stream_compact_prefill(const char **gate, const char **up,
                                       const char **down, const int32_t **ids,
                                       uint32_t *experts, uint32_t in_dim = 0,
                                       uint32_t mid_dim = 0, uint32_t out_dim = 0);
+static void cuda_stream_copy_release(void);
 
 static void cuda_stream_selected_cache_invalidate(void) {
     g_stream_selected_cache.valid = 0;
@@ -2923,6 +2924,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     }
     cuda_stream_selected_cache_release();
     cuda_stream_selected_stage_release();
+    cuda_stream_copy_release();
     g_n_gpus = 0;
     g_device_is_spark = false;
     g_cublas_ready = 0;
@@ -27137,6 +27139,368 @@ struct cuda_stream_upload_batch {
     ~cuda_stream_upload_batch() { (void)finish(); }
 };
 
+/* A single staged pread of a few MiB sustains only ~5 GB/s from NVMe, while a
+ * handful of overlapping preads pull ~13 GB/s from the same device, so expert
+ * staging is queue-depth bound rather than device bound. Fill the request list
+ * with several readers at once and copy each landed request while the others
+ * are still reading.
+ *
+/* One staging buffer, one completion event and one worker slot per index. Each
+ * index carries at most one request, so no buffer is reused until its own copy
+ * has been waited on, and every request keeps its destination. */
+enum { CUDA_STREAM_COPY_MAX_READERS = 32u };
+struct cuda_stream_copy_request {
+    char *destination;
+    uint64_t offset, bytes;
+};
+struct cuda_stream_copy_pool {
+    pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t requested = PTHREAD_COND_INITIALIZER;
+    pthread_cond_t landed = PTHREAD_COND_INITIALIZER;
+    pthread_t workers[CUDA_STREAM_COPY_MAX_READERS] = {};
+    unsigned started = 0;
+    unsigned quitting = 0;
+    const cuda_stream_copy_request *req[CUDA_STREAM_COPY_MAX_READERS] = {};
+    const char *payloads[CUDA_STREAM_COPY_MAX_READERS] = {};
+    unsigned read_ok[CUDA_STREAM_COPY_MAX_READERS] = {};
+    /* A monotonic ticket per request: posting hands index i one request and the
+     * worker answers with that same ticket, so a fast follow-up can never be
+     * mistaken for the reply to the request being waited for. */
+    unsigned posted[CUDA_STREAM_COPY_MAX_READERS] = {};
+    unsigned answered[CUDA_STREAM_COPY_MAX_READERS] = {};
+    int fd = -1, direct_fd = -1;
+    uint64_t align = 1, file_size = 0, stage_bytes = 0;
+};
+static cuda_stream_copy_pool g_stream_copy_pool;
+static unsigned g_stream_copy_readers = 0;
+static cudaStream_t g_stream_copy_stream = NULL;
+static void *g_stream_copy_raw[CUDA_STREAM_COPY_MAX_READERS] = {};
+static void *g_stream_copy_stage[CUDA_STREAM_COPY_MAX_READERS] = {};
+static cudaEvent_t g_stream_copy_event[CUDA_STREAM_COPY_MAX_READERS] = {};
+static uint64_t g_stream_copy_stage_bytes = 0;
+
+static unsigned cuda_stream_copy_reader_count(void) {
+    if (g_stream_copy_readers) return g_stream_copy_readers;
+    unsigned readers = 8;
+    const char *env = getenv("DS4_CUDA_EXPERT_READ_DEPTH");
+    if (getenv("DS4_CUDA_DISABLE_EXPERT_PARALLEL_READ")) readers = 1;
+    else if (env && env[0]) {
+        char *end = NULL;
+        unsigned long v = strtoul(env, &end, 10);
+        if (end && end != env) readers = (unsigned)v;
+    }
+    if (readers < 1) readers = 1;
+    if (readers > CUDA_STREAM_COPY_MAX_READERS) readers = CUDA_STREAM_COPY_MAX_READERS;
+    g_stream_copy_readers = readers;
+    return readers;
+}
+
+static void cuda_stream_copy_release(void) {
+    auto &pool = g_stream_copy_pool;
+    pthread_mutex_lock(&pool.mutex);
+    pool.quitting = 1;
+    pthread_cond_broadcast(&pool.requested);
+    pthread_mutex_unlock(&pool.mutex);
+    for (unsigned i = 0; i < pool.started; i++) (void)pthread_join(pool.workers[i], NULL);
+    /* Tear down leaves the pool reusable: a backend that is initialized again
+     * must not inherit a quit flag, or its first wave waits for readers that
+     * return before reading anything. */
+    pthread_mutex_lock(&pool.mutex);
+    pool.quitting = 0;
+    pool.started = 0;
+    pool.fd = pool.direct_fd = -1;
+    pthread_mutex_unlock(&pool.mutex);
+    if (g_stream_copy_stream) {
+        (void)cudaStreamDestroy(g_stream_copy_stream);
+        g_stream_copy_stream = NULL;
+    }
+    for (unsigned i = 0; i < CUDA_STREAM_COPY_MAX_READERS; i++) {
+        if (g_stream_copy_event[i]) {
+            (void)cudaEventDestroy(g_stream_copy_event[i]);
+            g_stream_copy_event[i] = NULL;
+        }
+        if (g_stream_copy_raw[i]) {
+            (void)cudaFreeHost(g_stream_copy_raw[i]);
+            g_stream_copy_raw[i] = NULL;
+        }
+        g_stream_copy_stage[i] = NULL;
+    }
+    g_stream_copy_stage_bytes = 0;
+}
+
+static void *cuda_stream_copy_worker(void *arg) {
+    cuda_stream_copy_pool &pool = g_stream_copy_pool;
+    const unsigned index = (unsigned)(uintptr_t)arg;
+    unsigned served = 0;
+    for (;;) {
+        pthread_mutex_lock(&pool.mutex);
+        while (!pool.quitting && pool.posted[index] == served)
+            pthread_cond_wait(&pool.requested, &pool.mutex);
+        if (pool.quitting) {
+            pthread_mutex_unlock(&pool.mutex);
+            return NULL;
+        }
+        const cuda_stream_copy_request request = *pool.req[index];
+        const unsigned ticket = pool.posted[index];
+        const int fd = pool.fd;
+        const int direct_fd = pool.direct_fd;
+        const uint64_t align = pool.align;
+        const uint64_t file_size = pool.file_size;
+        const uint64_t stage_bytes = pool.stage_bytes;
+        void *stage = g_stream_copy_stage[index];
+        pthread_mutex_unlock(&pool.mutex);
+
+        /* Requests are read-only and disjoint. Each worker owns one staging
+         * buffer; a per-thread descriptor keeps the shared fallback teardown
+         * from closing another reader's descriptor. */
+        int owned_direct = direct_fd;
+        const char *payload = NULL;
+        const int ok = fd >= 0 && stage &&
+            cuda_model_stage_read_from(fd, &owned_direct, align, file_size,
+                                       stage, stage_bytes, request.offset,
+                                       request.bytes, &payload);
+        if (owned_direct != direct_fd) {
+            pthread_mutex_lock(&pool.mutex);
+            pool.direct_fd = -1;
+            pthread_mutex_unlock(&pool.mutex);
+        }
+
+        pthread_mutex_lock(&pool.mutex);
+        pool.read_ok[index] = (unsigned)(ok != 0);
+        pool.payloads[index] = ok ? payload : NULL;
+        pool.answered[index] = ticket;
+        pthread_cond_broadcast(&pool.landed);
+        pthread_mutex_unlock(&pool.mutex);
+        served = ticket;
+    }
+}
+
+static void cuda_stream_copy_free_stages(void) {
+    for (unsigned i = 0; i < CUDA_STREAM_COPY_MAX_READERS; i++) {
+        if (g_stream_copy_event[i]) {
+            (void)cudaEventDestroy(g_stream_copy_event[i]);
+            g_stream_copy_event[i] = NULL;
+        }
+        if (g_stream_copy_raw[i]) {
+            (void)cudaFreeHost(g_stream_copy_raw[i]);
+            g_stream_copy_raw[i] = NULL;
+        }
+        g_stream_copy_stage[i] = NULL;
+    }
+    g_stream_copy_stage_bytes = 0;
+}
+
+static int cuda_stream_copy_ready(unsigned readers, uint64_t bytes) {
+    if (bytes == 0) return 0;
+    if (g_stream_copy_stage_bytes >= bytes && g_stream_copy_stream) return 1;
+    /* No reader touches a staging buffer between waves, so enlarging the pool
+     * here is safe. */
+    cuda_stream_copy_free_stages();
+    cudaStream_t stream = NULL;
+    if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (bytes > (UINT64_MAX >> 1) - (g_model_direct_align > 1 ? g_model_direct_align : 1))
+        return 0;
+    const uint64_t padded = bytes + (g_model_direct_align > 1 ? g_model_direct_align : 1);
+    if (padded > (uint64_t)SIZE_MAX) {
+        (void)cudaStreamDestroy(stream);
+        return 0;
+    }
+    for (unsigned i = 0; i < readers; i++) {
+        if (cudaMallocHost(&g_stream_copy_raw[i], (size_t)padded) != cudaSuccess ||
+            cudaEventCreateWithFlags(&g_stream_copy_event[i], cudaEventDisableTiming) !=
+                cudaSuccess) {
+            fprintf(stderr, "ds4: CUDA parallel expert staging allocation failed\n");
+            (void)cudaGetLastError();
+            (void)cudaStreamDestroy(stream);
+            cuda_stream_copy_free_stages();
+            return 0;
+        }
+        g_stream_copy_stage[i] =
+            cuda_align_ptr(g_stream_copy_raw[i], g_model_direct_align);
+    }
+    g_stream_copy_stream = stream;
+    g_stream_copy_stage_bytes = bytes;
+    return 1;
+}
+
+/* Returns 1 once every request has landed on the device, 0 after a read or copy
+ * failure, and -1 when the parallel path never started, so callers can fall
+ * back to the sequential one. */
+static int cuda_stream_copy_requests(const cuda_stream_copy_request *requests,
+                                     size_t count,
+                                     const void *model_map,
+                                     uint64_t model_size,
+                                     uint8_t *landed) {
+    if (landed) memset(landed, 0, count * sizeof(landed[0]));
+    if (count == 0) return 1;
+    if (!landed) return -1;
+    uint64_t bytes = 0;
+    for (size_t i = 0; i < count; i++)
+        if (requests[i].bytes > bytes) bytes = requests[i].bytes;
+    const unsigned readers = cuda_stream_copy_reader_count();
+    if (!cuda_stream_copy_ready(readers, bytes)) return -1;
+    auto &pool = g_stream_copy_pool;
+    if (pool.started < readers) {
+        pthread_mutex_lock(&pool.mutex);
+        while (pool.started < readers) {
+            if (pthread_create(&pool.workers[pool.started], NULL,
+                               cuda_stream_copy_worker,
+                               (void *)(uintptr_t)pool.started) != 0)
+                break;
+            pool.started++;
+        }
+        pthread_mutex_unlock(&pool.mutex);
+        if (pool.started == 0) return -1;
+    }
+    const unsigned live = pool.started < readers ? pool.started : readers;
+    int fd = dup(g_model_fd);
+    if (fd < 0) return -1;
+    int direct_fd = g_model_direct_fd >= 0 ? dup(g_model_direct_fd) : -1;
+    int ok = 1;
+    bool failed = false;
+    size_t next = 0;
+    unsigned outstanding = 0;
+    bool slot_busy[CUDA_STREAM_COPY_MAX_READERS] = {};
+    size_t slot_request[CUDA_STREAM_COPY_MAX_READERS] = {};
+    unsigned expect[CUDA_STREAM_COPY_MAX_READERS] = {};
+    bool recorded[CUDA_STREAM_COPY_MAX_READERS] = {};
+    pthread_mutex_lock(&pool.mutex);
+    pool.fd = fd;
+    pool.direct_fd = direct_fd;
+    pool.align = g_model_direct_align;
+    pool.file_size = g_model_file_size;
+    pool.stage_bytes = g_stream_copy_stage_bytes +
+        (g_model_direct_align > 1 ? g_model_direct_align : 1);
+    /* Continue the workers' ticket sequence: a ticket that repeats one they
+     * already served looks like no work at all, and both sides wait. */
+    for (unsigned i = 0; i < live; i++) expect[i] = pool.posted[i];
+    pthread_mutex_unlock(&pool.mutex);
+    /* A landed read is copied and its reader refilled at once: waiting for a
+     * whole wave would leave every other reader idle behind the slowest pread,
+     * which is the queue starvation this pool exists to avoid. */
+    while (ok && (next < count || outstanding)) {
+        for (unsigned i = 0; ok && i < live && next < count; i++) {
+            if (slot_busy[i]) continue;
+            /* Its own event, so this buffer stays untouched until its previous
+             * copy has landed. An unrecorded event has no copy to wait for. */
+            if (recorded[i] &&
+                !cuda_ok(cudaEventSynchronize(g_stream_copy_event[i]),
+                         "parallel expert staging wait")) {
+                ok = 0;
+                break;
+            }
+            const unsigned ticket = ++expect[i];
+            slot_request[i] = next;
+            pthread_mutex_lock(&pool.mutex);
+            pool.req[i] = requests + next;
+            pool.read_ok[i] = 0;
+            /* Every reader waits on this one queue, so wake them all: a signal
+             * may choose a reader whose own slot got no work, and the request
+             * would wait for a reader that was never told about it. */
+            pool.posted[i] = ticket;
+            pthread_cond_broadcast(&pool.requested);
+            pthread_mutex_unlock(&pool.mutex);
+            slot_busy[i] = true;
+            outstanding++;
+            next++;
+        }
+        if (!ok) break;
+        pthread_mutex_lock(&pool.mutex);
+        int answered_any = 0;
+        for (unsigned i = 0; i < live && !answered_any; i++)
+            if (slot_busy[i] && pool.answered[i] == expect[i]) answered_any = 1;
+        while (!answered_any) {
+            pthread_cond_wait(&pool.landed, &pool.mutex);
+            for (unsigned i = 0; i < live && !answered_any; i++)
+                if (slot_busy[i] && pool.answered[i] == expect[i]) answered_any = 1;
+        }
+        pthread_mutex_unlock(&pool.mutex);
+        for (unsigned i = 0; i < live; i++) {
+            if (!slot_busy[i]) continue;
+            pthread_mutex_lock(&pool.mutex);
+            const int answered = pool.answered[i] == expect[i];
+            const char *payload = pool.payloads[i];
+            const unsigned read_ok = pool.read_ok[i];
+            pthread_mutex_unlock(&pool.mutex);
+            if (!answered) continue;
+            slot_busy[i] = false;
+            outstanding--;
+            const cuda_stream_copy_request &request = requests[slot_request[i]];
+            /* Read failures end the batch, but the requests that did land here
+             * are copied: what reached the device is kept rather than redone. */
+            if (!read_ok) {
+                failed = true;
+                continue;
+            }
+            if (cudaMemcpyAsync(request.destination, payload,
+                                (size_t)request.bytes, cudaMemcpyHostToDevice,
+                                g_stream_copy_stream) != cudaSuccess ||
+                cudaEventRecord(g_stream_copy_event[i], g_stream_copy_stream) !=
+                    cudaSuccess) {
+                fprintf(stderr,
+                        "ds4: CUDA parallel expert copy failed for %.2f MiB: %s\n",
+                        (double)request.bytes / 1048576.0,
+                        cudaGetErrorString(cudaGetLastError()));
+                ok = 0;
+                break;
+            }
+            landed[slot_request[i]] = 1;
+            recorded[i] = true;
+            cuda_model_drop_file_pages(request.offset, request.bytes);
+            cuda_model_discard_source_pages(model_map, model_size, request.offset,
+                                            request.bytes);
+        }
+    }
+    /* Even a bailed batch still owns its readers: nothing may free a staging
+     * buffer, a descriptor, or the per thread post counters while one is
+     * reading, so wait for every slot that is still outstanding. */
+    pthread_mutex_lock(&pool.mutex);
+    for (unsigned i = 0; i < live; i++) {
+        while (slot_busy[i] && pool.answered[i] != expect[i])
+            pthread_cond_wait(&pool.landed, &pool.mutex);
+        slot_busy[i] = false;
+    }
+    pthread_mutex_unlock(&pool.mutex);
+    /* Every slot starts its next read only after this wait, and no consumer
+     * stream may touch these destinations before the copies have landed. */
+    const int drained = cuda_ok(cudaStreamSynchronize(g_stream_copy_stream),
+                                "parallel expert staging drain") != 0;
+    if (!drained) {
+        memset(landed, 0, count * sizeof(landed[0]));
+        ok = 0;
+    }
+    pthread_mutex_lock(&pool.mutex);
+    pool.fd = -1;
+    pool.direct_fd = -1;
+    pthread_mutex_unlock(&pool.mutex);
+    if (direct_fd >= 0) close(direct_fd);
+    if (fd >= 0) close(fd);
+    return ok && !failed ? 1 : 0;
+}
+
+/* Headroom kept free while staging cached experts.  The flat 8 GiB was sized
+ * for 128 GB unified-memory hosts; on a 16 GiB card it reserved half the
+ * device and left too little room to stage a full layer of experts.  Scale it
+ * with the device instead: an eighth of VRAM, capped at the old 8 GiB so large
+ * cards keep the tuned behavior and at a quarter of VRAM so small cards keep a
+ * usable cache.  Override with DS4_CUDA_STREAM_EXPERT_RESERVE_MB. */
+static uint64_t cuda_stream_selected_free_reserve_bytes(uint64_t total_bytes) {
+    int present = 0;
+    const uint64_t env_reserve =
+        cuda_parse_mib_env("DS4_CUDA_STREAM_EXPERT_RESERVE_MB", &present);
+    if (present) return env_reserve;
+    if (total_bytes == 0) return UINT64_C(8) << 30;
+    uint64_t reserve = total_bytes / 8u;
+    if (reserve < UINT64_C(1) << 30) reserve = UINT64_C(1) << 30;
+    if (reserve > UINT64_C(8) << 30) reserve = UINT64_C(8) << 30;
+    const uint64_t small_card_cap = total_bytes / 4u;
+    if (reserve > small_card_cap) reserve = small_card_cap;
+    return reserve;
+}
+
 static int cuda_stream_selected_cache_begin_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t *selected_ids,
@@ -27189,7 +27553,8 @@ static int cuda_stream_selected_cache_begin_load(
             if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, g_gpu[0].device_id) == cudaSuccess &&
                 integrated && ds4_linux_nonmovable_memory(&host_available))
                 free_bytes = (size_t)std::min(host_available, (uint64_t)total_bytes);
-            const uint64_t reserve = UINT64_C(8) << 30;
+            const uint64_t reserve =
+                cuda_stream_selected_free_reserve_bytes((uint64_t)total_bytes);
             const uint64_t available = free_bytes > reserve ? free_bytes - reserve : 0;
             capacity = std::min(capacity, available / expert_bytes);
             if (capacity < unique.size()) {
@@ -27245,6 +27610,13 @@ static int cuda_stream_selected_cache_begin_load(
             slot.used = stamp;
         }
         cuda_stream_upload_batch uploads;
+        /* Every expert of one layer lives in three tensors, and consecutive
+         * experts are adjacent inside each of them. Reading gate/up/down per
+         * expert interleaves three streams in ~3 MiB steps; claiming the slots
+         * first and then sweeping one tensor at a time, in expert order, keeps
+         * each stream sequential. The staged copies still pipeline. */
+        std::vector<std::pair<uint32_t, uint32_t> > missing;
+        missing.reserve(unique.size());
         for (size_t i = 0; i < unique.size(); i++) {
             if (slots[i] >= 0) continue;
             uint32_t victim = UINT32_MAX;
@@ -27265,22 +27637,78 @@ static int cuda_stream_selected_cache_begin_load(
             const uint64_t gate = table->gate_offset + expert * table->gate_expert_bytes;
             const uint64_t up = table->up_offset + expert * table->gate_expert_bytes;
             const uint64_t down = table->down_offset + expert * table->down_expert_bytes;
-            uploads.active = true;
-            if (!cuda_model_copy_to_device_streamed(
-                    cache.gate_ptr + (uint64_t)victim * table->gate_expert_bytes,
-                    table->model_map, table->model_size, gate, table->gate_expert_bytes, "stream gate", uploads.chunks) ||
-                !cuda_model_copy_to_device_streamed(
-                    cache.up_ptr + (uint64_t)victim * table->gate_expert_bytes,
-                    table->model_map, table->model_size, up, table->gate_expert_bytes, "stream up", uploads.chunks) ||
-                !cuda_model_copy_to_device_streamed(
-                    cache.down_ptr + (uint64_t)victim * table->down_expert_bytes,
-                    table->model_map, table->model_size, down, table->down_expert_bytes, "stream down", uploads.chunks))
-                return 0;
+            /* Claimed now, indexed only once its weights are present: a failed
+             * read must leave an ordinary miss, never a stale hit. */
             slot = {gate, up, down, stamp};
-            g_stream_expert_by_gate[gate] = victim;
             slots[i] = (int32_t)victim;
+            missing.push_back({(uint32_t)expert, victim});
         }
-        if (!uploads.finish()) return 0;
+        std::sort(missing.begin(), missing.end());
+        std::vector<cuda_stream_copy_request> requests;
+        try {
+            requests.reserve(3u * missing.size());
+            for (unsigned part = 0; part < 3u; part++) {
+                const uint64_t offset = part == 0u ? table->gate_offset :
+                    part == 1u ? table->up_offset : table->down_offset;
+                const uint64_t per_expert = part == 2u ? table->down_expert_bytes :
+                    table->gate_expert_bytes;
+                char *base = part == 0u ? cache.gate_ptr :
+                    part == 1u ? cache.up_ptr : cache.down_ptr;
+                for (const auto &pair : missing)
+                    requests.push_back({base + (uint64_t)pair.second * per_expert,
+                        offset + (uint64_t)pair.first * per_expert, per_expert});
+            }
+        } catch (...) {
+            return 0;
+        }
+        static const int dbg = getenv("DS4_DBG_COPY") != NULL;
+        if (!requests.empty()) {
+            bool failed = false;
+            std::vector<uint8_t> landed(requests.size(), 0);
+            const int parallel = cuda_stream_copy_requests(requests.data(),
+                    requests.size(), table->model_map, table->model_size,
+                    landed.data());
+            if (parallel == 1) {
+                if (!uploads.finish()) return 0;
+            } else if (parallel < 0) {
+                uploads.active = true;
+                for (size_t i = 0; i < requests.size(); i++) {
+                    if (dbg) fprintf(stderr, "DBG copy %zu/%zu off=%llu bytes=%llu\n",
+                            i, requests.size(), (unsigned long long)requests[i].offset,
+                            (unsigned long long)requests[i].bytes);
+                    if (!cuda_model_copy_to_device_streamed(requests[i].destination,
+                            table->model_map, table->model_size,
+                            requests[i].offset, requests[i].bytes, "stream expert",
+                            uploads.chunks))
+                        break;
+                    landed[i] = 1;
+                }
+                if (dbg) fprintf(stderr, "DBG copy done, drain\n");
+                if (uploads.finish() == 0)
+                    landed.assign(requests.size(), 0);
+                for (size_t i = 0; i < requests.size(); i++)
+                    if (!landed[i]) failed = true;
+            } else {
+                failed = true;
+            }
+            /* Publish every expert whose three tensors all landed: a partly
+             * staged batch must keep what the device already holds rather than
+             * reading it again. */
+            for (size_t i = 0; i < missing.size(); i++) {
+                if (!landed[i] || !landed[missing.size() + i] ||
+                    !landed[2u * missing.size() + i])
+                    continue;
+                const uint64_t expert = missing[i].first;
+                const uint64_t gate =
+                    table->gate_offset + expert * table->gate_expert_bytes;
+                auto &slot = g_stream_expert_slots[missing[i].second];
+                slot = {gate,
+                    table->up_offset + expert * table->gate_expert_bytes,
+                    table->down_offset + expert * table->down_expert_bytes, stamp};
+                g_stream_expert_by_gate[gate] = missing[i].second;
+            }
+            if (failed) return 0;
+        } else if (!uploads.finish()) return 0;
         g_stream_prefill_ids = remap;
         g_stream_prefill_slots = slots;
         for (auto &id : remap) id = slots[id];
