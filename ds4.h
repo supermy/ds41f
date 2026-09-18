@@ -160,6 +160,12 @@ typedef struct {
     bool cuda_tensor_parallel;
     bool ssd_streaming;
     bool ssd_streaming_cold;
+    /* CUDA: keep token_embd in pinned host memory instead of device memory. */
+    bool host_offload_token_embd;
+    /* CUDA SSD streaming: pin routed experts in host memory when they fit.
+     * 0 = disabled, otherwise an explicit byte cap; absent means auto. */
+    bool ram_resident_experts_off;
+    uint64_t ram_resident_experts_bytes;
     bool ssd_streaming_full_layers_set;
     bool inspect_only;
     /* Multi-GPU placement uses this to price per-layer KV storage. */

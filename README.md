@@ -18,6 +18,10 @@ We test things in integration: model loading, prompt rendering,
 tool calls, KV state, the HTTP server, and the coding agent are built and tested together.
 The repository also includes tools and data for GGUF, imatrix, quality, and speed.
 
+**中文文档**：[README_CN.md](README_CN.md)（含 CUDA SSD 流式调优章节）、
+[docs/OPTIMIZATION_HISTORY.md](docs/OPTIMIZATION_HISTORY.md)（历次优化的目标与实测）、
+根目录下的 `优化步骤教程.md`（本机调优步骤教程）。
+
 ## Supported hardware
 
 * **Metal**, the primary target, on Macs with 96 GB or more. Smaller machines
@@ -197,6 +201,71 @@ support GGUF. It can improve generation, but not every workload benefits.
 Read [speculative decoding](docs/SPECULATIVE_DECODING.md) for setup and the
 difference between default opportunistic sampling and `--mtp-exact-sampling`.
 
+### SSD streaming tuning (CUDA)
+
+SSD streaming turns "will this model fit?" into "how many bytes must cross per token?".
+The measured result of tuning it is recorded below; the full derivation is in
+[docs/OPTIMIZATION_HISTORY.md](docs/OPTIMIZATION_HISTORY.md), and the local
+step-by-step tutorial lives in `优化步骤教程.md`.
+
+Build first. `make cuda` auto-detects the arch when `CUDA_ARCH` is unset, but it
+does **not** rebuild the tests — always rebuild them separately after touching
+`ds4_cuda.cu`, or you are benchmarking a stale binary:
+
+```sh
+make cuda
+make tests/test_cuda_ssd_cache
+./tests/test_cuda_ssd_cache     # ~5 s; hangs (rather than fails) if the prefetch pool breaks
+```
+
+Recommended invocations on a 16 GiB card with ~90 GB of RAM:
+
+```sh
+# DeepSeek V4 Flash IQ2XXS — routed experts fit in RAM, so the pin-and-copy path engages
+./ds4 --cuda -m ds4flash-iq2xxs.gguf --ssd-streaming \
+      --ssd-streaming-cache-experts 512 -c 4096 --prefill-chunk 512 \
+      --nothink --temp 0 -n 96
+
+# DeepSeek V4.1 Flash Q2 — experts do not fit in RAM; falls back to staged reads
+./ds4 --cuda -m DeepSeek-V4.1-Flash-Q2.gguf --ssd-streaming \
+      --ssd-streaming-cache-experts 41 -c 2048 --prefill-chunk 512 \
+      --nothink --temp 0 -n 64
+```
+
+Flags that matter, and when to reach for them:
+
+| Flag / env | Default | Use it when |
+| --- | --- | --- |
+| `--ssd-streaming-cache-experts N` | auto | Give a **slot count**, not `NGB`: `NGB` also reserves two full prefill layers and typically collapses to a single slot. |
+| `--ram-resident-experts off\|auto\|NGB` | `auto` | `auto` pins the whole routed expert set in host memory when `MemAvailable − reserve` can hold it, turning staged reads into host-to-device copies. It is all-or-nothing on purpose; use `NGB` to cap the pool, `off` to disable. `DS4_RAM_RESIDENT_EXPERTS=0` also disables it. |
+| `--host-offload-token-embd` | off | Frees ~1.2 GiB of VRAM by keeping `token_embd` in pinned host memory. Only worth hiding tensors that are gathered *one row per token*; never move whole-matrix GEMV weights this way. |
+| `DS4_CUDA_EXPERT_READ_DEPTH=N` | 8 | Queue depth for overlapping expert `pread`s. 8 was the measured peak; beyond that there is no gain, only more pinned memory. |
+| `DS4_EXPERT_POOL_READERS=N` | 16 | Threads used for the one-shot expert pin at startup (8 MiB blocks, offset-sorted). |
+| `DS4_CUDA_DISABLE_EXPERT_PARALLEL_READ=1` | unset | Serial baseline. Every A/B comparison should be measured against this. |
+
+Startup tells you which path you got — look for `ds4: RAM-resident experts: ...`
+(either the pinned summary or the reason it was skipped) and
+`ds4: expert cache: N slots x X MiB = Y GiB VRAM`.
+
+Measured on an RTX 5060 Ti 16 GiB with 93 GB of RAM, same prompt, `--temp 0`:
+
+| Model | Configuration | Decode t/s |
+| --- | --- | --- |
+| V4 Flash IQ2XXS | expert pool disabled | 7.22 |
+| V4 Flash IQ2XXS | expert pool auto-enabled | **13.02** |
+| V4.1 Flash Q2 | serial expert reads | 1.93 |
+| V4.1 Flash Q2 | parallel reads (default) | 3.80 |
+
+Pitfalls worth knowing before you start tuning:
+
+* `--temp 0` is mandatory for A/B comparisons; the default sampling is non-deterministic.
+* Long prompts allocate one slot per unique routed expert per layer: on IQ2XXS a
+  799-token prompt already caps you at 512 slots, and 960 slots fails prefill with
+  `gpu layer 33 ffn batch encode failed`. Short prompts are the only way to push to 960.
+* The expert slots freed by `--host-offload-token-embd` do **not** become more expert
+  slots — the planner sizes slots from total VRAM, so the real gain is context, prefill,
+  and OOM headroom.
+
 ### Output and power
 
 Thinking is enabled by default. Use `--nothink` or `/nothink` for direct
@@ -259,6 +328,10 @@ DGX Spark results, comparison conditions, and benchmark commands.
 - [Coding agent clients](docs/CLIENTS.md): Pi, OpenCode, Codex CLI, and Claude Code.
 - [Performance](docs/PERFORMANCE.md): reproducible measurements and recorded baselines.
 - [Testing and development](docs/TESTING.md): regression tests, debugging, and model-building tools.
+- [Optimization history and goals](docs/OPTIMIZATION_HISTORY.md): every CUDA SSD-streaming pass, its measured result, and what was rejected — plus [the next planned step](docs/PLAN-host-expert-cache.md), archived and not implemented yet.
+
+Local tuning notes, in Chinese: root-level `优化步骤教程.md`
+(build → baseline → concurrency sweep → debugging hangs → regression).
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before sending a pull request.
 

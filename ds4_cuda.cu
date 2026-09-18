@@ -405,6 +405,37 @@ struct cuda_model_arena {
     uint64_t used;
 };
 
+/* Weights deliberately left out of device memory.
+ *
+ * The kernel-visible pointer is the UVA alias of a pinned host buffer, so
+ * these ranges cost device memory nothing and every read is a PCIe fetch.
+ * That only pays for access that touches a few rows per token (the embedding
+ * gather reads one row), never for weights a kernel streams whole. */
+struct cuda_host_range {
+    const void *host_base;
+    uint64_t offset;
+    uint64_t bytes;
+    char *host_ptr;
+    char *device_ptr;
+};
+static std::vector<cuda_host_range> g_host_ranges;
+
+static const cuda_host_range *cuda_host_range_lookup(const void *model_map,
+                                                     uint64_t offset,
+                                                     uint64_t bytes) {
+    if (!model_map || bytes == 0) return NULL;
+    const uint64_t end = offset + bytes;
+    if (end < offset) return NULL;
+    for (const cuda_host_range &r : g_host_ranges) {
+        if (r.host_base == model_map &&
+            offset >= r.offset &&
+            end <= r.offset + r.bytes) {
+            return &r;
+        }
+    }
+    return NULL;
+}
+
 struct cuda_q8_f16_range {
     const void *host_base;
     uint64_t offset;
@@ -752,6 +783,8 @@ static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
 
 static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
     if (bytes == 0) return cuda_model_ptr(model_map, offset);
+    const cuda_host_range *host = cuda_host_range_lookup(model_map, offset, bytes);
+    if (host) return host->device_ptr + (offset - host->offset);
     const uint64_t end = offset + bytes;
     if (end < offset) return NULL;
     auto exact = g_model_range_by_offset.find(offset);
@@ -1398,6 +1431,7 @@ static const char *cuda_resolve_weight_ptr(const void *model_map,
 
 static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, uint64_t bytes) {
     if (bytes == 0) return 1;
+    if (cuda_host_range_lookup(model_map, offset, bytes)) return 1;
     if (model_map == g_model_host_base &&
         (g_model_device_owned || g_model_registered)) return 1;
 
@@ -2231,6 +2265,267 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
         g_model_direct_align, g_model_file_size, stage, stage_bytes, offset, bytes, payload);
 }
 
+/* Routed expert weights pinned in host memory.
+ *
+ * When the routed set fits in RAM, the SSD leaves the decode critical path: a
+ * resident expert becomes a pinned-to-device copy instead of a pread. The pool
+ * is indexed by file offset and is deliberately *not* part of g_host_ranges --
+ * those ranges are excluded from the device model spans, while these bytes must
+ * stay invisible to the span builder and to every kernel pointer lookup. That
+ * is also why the allocation skips cudaHostAllocMapped: there is no device
+ * alias, so no kernel can stream an expert over PCIe one byte at a time. */
+struct cuda_expert_pool_range {
+    uint64_t offset;
+    uint64_t bytes;
+    char    *host;
+    void    *raw;
+};
+static std::vector<cuda_expert_pool_range> g_expert_pool;
+static const void *g_expert_pool_map;
+static uint64_t g_expert_pool_bytes;
+
+static const char *cuda_expert_pool_lookup(const void *model_map,
+                                           uint64_t offset,
+                                           uint64_t bytes) {
+    if (g_expert_pool.empty() || bytes == 0) return NULL;
+    if (model_map && g_expert_pool_map && model_map != g_expert_pool_map) return NULL;
+    const uint64_t end = offset + bytes;
+    if (end < offset) return NULL;
+    size_t lo = 0, hi = g_expert_pool.size();
+    while (lo < hi) {
+        const size_t mid = lo + (hi - lo) / 2u;
+        if (g_expert_pool[mid].offset <= offset) lo = mid + 1u;
+        else hi = mid;
+    }
+    if (lo == 0) return NULL;
+    const cuda_expert_pool_range &r = g_expert_pool[lo - 1u];
+    const uint64_t delta = offset - r.offset;
+    if (delta > r.bytes || bytes > r.bytes - delta) return NULL;
+    return r.host + delta;
+}
+
+static int cuda_expert_pool_read(int fd, int *direct_fd, uint64_t align,
+                                 uint64_t file_size, char *dst,
+                                 uint64_t offset, uint64_t bytes) {
+    if (*direct_fd >= 0 && align > 1 && file_size != 0 &&
+        offset % align == 0 && bytes % align == 0 &&
+        ((uintptr_t)dst % (uintptr_t)align) == 0) {
+        if (cuda_pread_full(*direct_fd, dst, bytes, offset)) return 1;
+        close(*direct_fd);
+        *direct_fd = -1;
+    }
+    if (!cuda_pread_full(fd, dst, bytes, offset)) return 0;
+#if defined(POSIX_FADV_DONTNEED)
+    /* The pool is the only copy we want; do not let 70+ GiB sit in the page
+     * cache the rest of the machine needs. */
+    (void)posix_fadvise(fd, (off_t)offset, (off_t)bytes, POSIX_FADV_DONTNEED);
+#endif
+    return 1;
+}
+
+struct cuda_expert_pool_chunk {
+    uint64_t offset;
+    uint64_t bytes;
+    char    *dst;
+};
+struct cuda_expert_pool_loader {
+    int fd;
+    uint64_t align;
+    uint64_t file_size;
+    const cuda_expert_pool_chunk *chunks;
+    size_t count;
+    std::atomic<size_t> next;
+    std::atomic<int> failed;
+};
+
+static void *cuda_expert_pool_loader_main(void *arg) {
+    cuda_expert_pool_loader *l = (cuda_expert_pool_loader *)arg;
+    int direct_fd = g_model_direct_fd >= 0 ? dup(g_model_direct_fd) : -1;
+    for (;;) {
+        const size_t i = l->next.fetch_add(1u, std::memory_order_relaxed);
+        if (i >= l->count) break;
+        if (!cuda_expert_pool_read(l->fd, &direct_fd, l->align, l->file_size,
+                                   l->chunks[i].dst, l->chunks[i].offset,
+                                   l->chunks[i].bytes))
+            l->failed.store(1, std::memory_order_relaxed);
+    }
+    if (direct_fd >= 0) close(direct_fd);
+    return NULL;
+}
+
+static void cuda_expert_pool_release(void) {
+    if (g_expert_pool.empty()) return;
+    if (ds4_gpu_set_current_device(0) == 0) (void)cudaDeviceSynchronize();
+    for (cuda_expert_pool_range &r : g_expert_pool) {
+        if (r.raw) (void)cudaFreeHost(r.raw);
+    }
+    g_expert_pool.clear();
+    g_expert_pool_map = NULL;
+    g_expert_pool_bytes = 0;
+}
+
+extern "C" void ds4_gpu_expert_pool_release(void) {
+    cuda_expert_pool_release();
+}
+
+extern "C" uint64_t ds4_gpu_expert_pool_bytes(void) {
+    return g_expert_pool_bytes;
+}
+
+extern "C" int ds4_gpu_expert_pool_install(const void *model_map,
+                                           uint64_t model_size,
+                                           const uint64_t *offsets,
+                                           const uint64_t *bytes,
+                                           uint32_t count) {
+    if (!model_map || !offsets || !bytes || count == 0) return 0;
+    if (g_model_fd < 0) return 0;
+    cuda_expert_pool_release();
+    if (ds4_gpu_set_current_device(0) != 0) return 0;
+
+    std::vector<uint32_t> order(count);
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        order[i] = i;
+        if (bytes[i] == 0 || offsets[i] > model_size ||
+            bytes[i] > model_size - offsets[i]) {
+            fprintf(stderr, "ds4: RAM-resident expert pool: range %u is outside the model file\n", i);
+            return 0;
+        }
+        if (total > UINT64_MAX - bytes[i]) return 0;
+        total += bytes[i];
+    }
+    std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+        return offsets[a] < offsets[b];
+    });
+    for (uint32_t k = 1; k < count; k++) {
+        const uint64_t prev_end = offsets[order[k - 1]] + bytes[order[k - 1]];
+        if (offsets[order[k]] < prev_end) {
+            fprintf(stderr, "ds4: RAM-resident expert pool: overlapping ranges\n");
+            return 0;
+        }
+    }
+
+    const uint64_t align = g_model_direct_align > 1 ? g_model_direct_align : 1;
+    try {
+        g_expert_pool.reserve(count);
+        for (uint32_t k = 0; k < count; k++) {
+            const uint32_t i = order[k];
+            void *raw = NULL;
+            const uint64_t padded = bytes[i] + align;
+            if (padded > (uint64_t)SIZE_MAX ||
+                cudaHostAlloc(&raw, (size_t)padded, 0) != cudaSuccess) {
+                (void)cudaGetLastError();
+                fprintf(stderr,
+                        "ds4: RAM-resident expert pool: pinned allocation failed at %.2f GiB "
+                        "of %.2f GiB; falling back to SSD streaming\n",
+                        (double)g_expert_pool_bytes / 1073741824.0,
+                        (double)total / 1073741824.0);
+                cuda_expert_pool_release();
+                return 0;
+            }
+            cuda_expert_pool_range r;
+            r.offset = offsets[i];
+            r.bytes = bytes[i];
+            r.raw = raw;
+            r.host = (char *)cuda_align_ptr(raw, align);
+            g_expert_pool.push_back(r);
+            g_expert_pool_bytes += bytes[i];
+        }
+    } catch (...) {
+        cuda_expert_pool_release();
+        return 0;
+    }
+    g_expert_pool_map = model_map;
+
+    /* Read in file order, in aligned chunks, with enough concurrent readers to
+     * saturate an NVMe drive. Each chunk lands straight in the pool. */
+    const uint64_t chunk = align > 1 ?
+        std::max(align, (UINT64_C(8) << 20) / align * align) : UINT64_C(8) << 20;
+    std::vector<cuda_expert_pool_chunk> chunks;
+    try {
+        for (const cuda_expert_pool_range &r : g_expert_pool) {
+            uint64_t off = 0;
+            /* Tensor offsets are 512-byte aligned in these GGUFs but not
+             * block aligned, so an O_DIRECT pread at the range start would
+             * fail. Read the short unaligned head and tail through the page
+             * cache and keep the bulk of every range O_DIRECT-legal. */
+            const uint64_t rem = align > 1 ? r.offset % align : 0;
+            if (rem != 0) {
+                const uint64_t n = std::min(align - rem, r.bytes);
+                chunks.push_back({r.offset, n, r.host});
+                off = n;
+            }
+            while (off < r.bytes) {
+                uint64_t n = std::min(chunk, r.bytes - off);
+                if (align > 1) n -= n % align;
+                if (n == 0) break;
+                chunks.push_back({r.offset + off, n, r.host + off});
+                off += n;
+            }
+            if (off < r.bytes)
+                chunks.push_back({r.offset + off, r.bytes - off, r.host + off});
+        }
+    } catch (...) {
+        cuda_expert_pool_release();
+        return 0;
+    }
+
+    unsigned readers = 16;
+    const char *env = getenv("DS4_EXPERT_POOL_READERS");
+    if (env && env[0]) {
+        const long v = strtol(env, NULL, 10);
+        if (v >= 1 && v <= 64) readers = (unsigned)v;
+    }
+    if (readers > chunks.size()) readers = (unsigned)std::max<size_t>(1, chunks.size());
+
+    fprintf(stderr,
+            "ds4: RAM-resident experts: preloading %.2f GiB into pinned host memory "
+            "with %u readers\n",
+            (double)total / 1073741824.0, readers);
+    fflush(stderr);
+
+    cuda_expert_pool_loader loader;
+    loader.fd = dup(g_model_fd);
+    loader.align = align;
+    loader.file_size = g_model_file_size;
+    loader.chunks = chunks.data();
+    loader.count = chunks.size();
+    loader.next.store(0, std::memory_order_relaxed);
+    loader.failed.store(0, std::memory_order_relaxed);
+    const double started = cuda_wall_sec();
+    if (loader.fd < 0) {
+        cuda_expert_pool_release();
+        return 0;
+    }
+    std::vector<pthread_t> threads(readers);
+    unsigned live = 0;
+    for (unsigned i = 0; i < readers; i++) {
+        if (pthread_create(&threads[i], NULL, cuda_expert_pool_loader_main,
+                           &loader) != 0)
+            break;
+        live++;
+    }
+    if (live == 0) {
+        close(loader.fd);
+        cuda_expert_pool_release();
+        return 0;
+    }
+    for (unsigned i = 0; i < live; i++) (void)pthread_join(threads[i], NULL);
+    close(loader.fd);
+    const double secs = cuda_wall_sec() - started;
+    if (loader.failed.load(std::memory_order_relaxed)) {
+        fprintf(stderr, "ds4: RAM-resident experts: preload read failed; "
+                        "falling back to SSD streaming\n");
+        cuda_expert_pool_release();
+        return 0;
+    }
+    fprintf(stderr,
+            "ds4: RAM-resident experts: %.2f GiB resident in %.1f s (%.1f GB/s)\n",
+            (double)total / 1073741824.0, secs,
+            secs > 0 ? (double)total / 1.0e9 / secs : 0.0);
+    return 1;
+}
+
 static void cuda_stream_selected_stage_release(void) {
     for (size_t i = 0; i < 4; i++) {
         if (g_stream_selected_stage_event[i]) {
@@ -2871,6 +3166,13 @@ extern "C" void ds4_gpu_cleanup(void) {
     ds4_gpu_decode_graphs_invalidate();
     g_current_logical_tier = -1;
 
+    /* The GPU is gone before any weight pointer stays valid, so release the
+     * pinned host ranges alongside the tier teardown below. */
+    for (const cuda_host_range &r : g_host_ranges) {
+        (void)cudaFreeHost(r.host_ptr);
+    }
+    g_host_ranges.clear();
+
     /* Multi-GPU teardown: events, streams, cublas handles, scratch
      * slabs, per-pair bounce buffers. */
     for (int i = 0; i < g_n_gpus; i++) {
@@ -2948,6 +3250,8 @@ extern "C" void ds4_gpu_cleanup(void) {
     cuda_model_range_release_all();
     cuda_derived_range_release_all();
     cuda_q8_f16_cache_release_all();
+    /* The pool owns pinned host memory no copy stream may still be reading. */
+    cuda_expert_pool_release();
     g_q8_f16_disabled_after_oom = 0;
     g_q8_f16_budget_notice_printed = 0;
     for (const cuda_q8_f32_range &r : g_q8_f32_ranges) {
@@ -4711,6 +5015,45 @@ extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_s
     if (cuda_span_fully_replaced(model_map, offset, bytes)) return 1;
     if (!cuda_model_range_ptr(model_map, offset, bytes, label ? label : "model_tensor")) return 0;
     return cuda_model_range_is_cached(model_map, offset, bytes);
+}
+
+extern "C" int ds4_gpu_set_host_resident_range(const void *model_map, uint64_t model_size,
+                                               uint64_t offset, uint64_t bytes,
+                                               const char *label) {
+    if (!model_map || bytes == 0) return 0;
+    if (offset > model_size || bytes > model_size - offset) return 0;
+    if (cuda_host_range_lookup(model_map, offset, bytes)) return 1;
+    const char *name = label ? label : "weights";
+
+    void *host = NULL;
+    cudaError_t err = cudaHostAlloc(&host, (size_t)bytes, cudaHostAllocMapped);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        fprintf(stderr,
+                "ds4: pinned host allocation for %s failed (%s); keeping it in device memory\n",
+                name, cudaGetErrorString(err));
+        return 0;
+    }
+    void *device = NULL;
+    if (cudaHostGetDevicePointer(&device, host, 0) != cudaSuccess || !device) {
+        (void)cudaGetLastError();
+        fprintf(stderr,
+                "ds4: no zero-copy pointer for %s; keeping it in device memory\n",
+                name);
+        (void)cudaFreeHost(host);
+        return 0;
+    }
+    memcpy(host, (const char *)model_map + offset, (size_t)bytes);
+    g_host_ranges.push_back({model_map, offset, bytes, (char *)host, (char *)device});
+    fprintf(stderr,
+            "ds4: CUDA host-resident %s %.2f GiB: pinned host memory, no device memory\n",
+            name, (double)bytes / 1073741824.0);
+    return 1;
+}
+
+extern "C" int ds4_gpu_range_is_host_resident(const void *model_map, uint64_t offset,
+                                              uint64_t bytes) {
+    return cuda_host_range_lookup(model_map, offset, bytes) != NULL;
 }
 
 extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label) {
@@ -27168,6 +27511,10 @@ struct cuda_stream_copy_pool {
      * mistaken for the reply to the request being waited for. */
     unsigned posted[CUDA_STREAM_COPY_MAX_READERS] = {};
     unsigned answered[CUDA_STREAM_COPY_MAX_READERS] = {};
+    /* Set when the worker served the request from the pinned host pool: no
+     * bytes were read, so the file-page bookkeeping below must be skipped. */
+    unsigned from_pool[CUDA_STREAM_COPY_MAX_READERS] = {};
+    const void *model_map = NULL;
     int fd = -1, direct_fd = -1;
     uint64_t align = 1, file_size = 0, stage_bytes = 0;
 };
@@ -27242,6 +27589,7 @@ static void *cuda_stream_copy_worker(void *arg) {
         }
         const cuda_stream_copy_request request = *pool.req[index];
         const unsigned ticket = pool.posted[index];
+        const void *model_map = pool.model_map;
         const int fd = pool.fd;
         const int direct_fd = pool.direct_fd;
         const uint64_t align = pool.align;
@@ -27255,10 +27603,20 @@ static void *cuda_stream_copy_worker(void *arg) {
          * from closing another reader's descriptor. */
         int owned_direct = direct_fd;
         const char *payload = NULL;
-        const int ok = fd >= 0 && stage &&
-            cuda_model_stage_read_from(fd, &owned_direct, align, file_size,
-                                       stage, stage_bytes, request.offset,
-                                       request.bytes, &payload);
+        int ok;
+        const char *resident = cuda_expert_pool_lookup(model_map, request.offset,
+                                                       request.bytes);
+        if (resident) {
+            /* Already in pinned host memory: skip the pread entirely and hand
+             * the pool pointer to the dispatcher's usual H2D copy. */
+            payload = resident;
+            ok = 1;
+        } else {
+            ok = fd >= 0 && stage &&
+                cuda_model_stage_read_from(fd, &owned_direct, align, file_size,
+                                           stage, stage_bytes, request.offset,
+                                           request.bytes, &payload);
+        }
         if (owned_direct != direct_fd) {
             pthread_mutex_lock(&pool.mutex);
             pool.direct_fd = -1;
@@ -27268,6 +27626,7 @@ static void *cuda_stream_copy_worker(void *arg) {
         pthread_mutex_lock(&pool.mutex);
         pool.read_ok[index] = (unsigned)(ok != 0);
         pool.payloads[index] = ok ? payload : NULL;
+        pool.from_pool[index] = (unsigned)(resident != NULL);
         pool.answered[index] = ticket;
         pthread_cond_broadcast(&pool.landed);
         pthread_mutex_unlock(&pool.mutex);
@@ -27370,6 +27729,7 @@ static int cuda_stream_copy_requests(const cuda_stream_copy_request *requests,
     pthread_mutex_lock(&pool.mutex);
     pool.fd = fd;
     pool.direct_fd = direct_fd;
+    pool.model_map = model_map;
     pool.align = g_model_direct_align;
     pool.file_size = g_model_file_size;
     pool.stage_bytes = g_stream_copy_stage_bytes +
@@ -27424,6 +27784,7 @@ static int cuda_stream_copy_requests(const cuda_stream_copy_request *requests,
             const int answered = pool.answered[i] == expect[i];
             const char *payload = pool.payloads[i];
             const unsigned read_ok = pool.read_ok[i];
+            const unsigned served_from_pool = pool.from_pool[i];
             pthread_mutex_unlock(&pool.mutex);
             if (!answered) continue;
             slot_busy[i] = false;
@@ -27449,9 +27810,13 @@ static int cuda_stream_copy_requests(const cuda_stream_copy_request *requests,
             }
             landed[slot_request[i]] = 1;
             recorded[i] = true;
-            cuda_model_drop_file_pages(request.offset, request.bytes);
-            cuda_model_discard_source_pages(model_map, model_size, request.offset,
-                                            request.bytes);
+            if (!served_from_pool) {
+                /* Nothing was read from the file for a pool hit, so there is
+                 * no page to drop and no mapped range to discard. */
+                cuda_model_drop_file_pages(request.offset, request.bytes);
+                cuda_model_discard_source_pages(model_map, model_size, request.offset,
+                                                request.bytes);
+            }
         }
     }
     /* Even a bailed batch still owns its readers: nothing may free a staging
@@ -27793,11 +28158,23 @@ static void *cuda_stream_prefetch_read(void *) {
     for (const auto &copy : p.copies) {
         for (uint64_t offset = 0; p.ok && offset < copy.bytes; offset += chunk) {
             if (p.cancel.load(std::memory_order_relaxed)) { p.ok = false; break; }
+            const uint64_t bytes = std::min(chunk, copy.bytes - offset);
+            const char *resident = cuda_expert_pool_lookup(p.table.model_map,
+                                                           copy.offset + offset, bytes);
+            if (resident) {
+                /* Already pinned in host memory: no pread and no staging ring.
+                 * Back-to-back copies on one stream keep H2D saturated -- the
+                 * drive is not involved, and the ring's event waits would only
+                 * serialize what should be one long DMA. */
+                p.ok = cudaMemcpyAsync(copy.destination + offset, resident, bytes,
+                    cudaMemcpyHostToDevice, p.stream) == cudaSuccess;
+                p.bytes += bytes;
+                continue;
+            }
             const unsigned ring = chunk_index % 2u;
             if (chunk_index >= 2 && cudaEventSynchronize(p.ready[ring]) != cudaSuccess) {
                 p.ok = false; break;
             }
-            const uint64_t bytes = std::min(chunk, copy.bytes - offset);
             const char *payload = NULL;
             p.ok = cuda_model_stage_read_from(p.fd, &p.direct_fd, p.align, p.file_size,
                 p.stage[ring], p.stage_bytes, copy.offset + offset, bytes, &payload) != 0;

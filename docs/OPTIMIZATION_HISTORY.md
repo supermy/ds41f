@@ -1,0 +1,192 @@
+# 历次优化记录与目标
+
+本文档按时间顺序记录在 CUDA 单卡（SSD 流式）路径上做过的每一次优化：
+**目标 → 做法 → 实测结果 → 结论**，以及一批"评估后被否决"的方案。
+本机基线环境：RTX 5060 Ti（16 GiB，可用 15.48 GiB，sm_120）、93 GB 内存、
+NVMe（Fanxiang S910Pro 2TB，`/data` 为 ext4 on nvme1n1p6）、CUDA 13.3。
+
+文档索引
+
+- 随时更新的当前计划：[PLAN-host-expert-cache.md](PLAN-host-expert-cache.md)（**已存档，尚未实施**）
+- 调优后的实用命令：仓库根目录 `优化步骤教程.md`、[中文 README](../README_CN.md) 的
+  「SSD 流式调优」章节、[英文 README](../README.md) 的 "SSD streaming tuning" 章节
+- 流式机制本身：[SSD_STREAMING.md](SSD_STREAMING.md)
+
+## 0. 目标
+
+**总目标**：在不改变输出正确性的前提下，把 V4 / V4.1 Flash 系列在「模型远大于显存、
+专家绝大部分躺在盘上」这种配置下的解码吞吐，推到介质供给带宽允许的上限。
+
+**当前目标清单（按优先级）**
+
+1. **读透式主机专家缓存**（[计划文档](PLAN-host-expert-cache.md)，**已存档、未实施**）：
+   覆盖 Q2 这类「专家装不进内存」的模型，估算 3.80 → ~6.9 t/s。
+   动工前必须先做计划里第 0 节的零代码对照实验，提升 < 20% 就回来讨论。
+2. **批处理解码**：同批 token 复用同一层的专家权重——GPU 侧纯吞吐提升，不需要写新内核
+   （batch 8 时每 token 专家数 6 → 5.5，batch 32 → 4.25）。
+3. **更小检查点**：IQ2XXS 相对 Q2 每 token 流量少约 7.5 倍，是最直接的杠杆。
+
+**已完成并固化的两个目标**
+
+- 串行 pread → 滑动窗口并发预取：V4.1 Q2 解码 1.93 → 3.80 t/s（第 1 节）。
+- 每 token 落盘读 → pinned 主机内存直拷：V4 Flash IQ2XXS 解码 7.22 → 13.02 t/s（第 3 节）。
+
+## 一句话结论（判据）
+
+流式解码的吞吐 ≈ **每 token 必须穿过的字节数 ÷ 供给带宽**。
+所以：
+
+1. 先算 `每 token 字节 × 实测 t/s`，看是否逼近盘带宽；
+   逼近了就说明该**削字节**（更小检查点 / 批处理摊薄 / 命中更快的介质），
+   而不是加管道（更大并发、更深的预取）。
+2. 也不要指望"<｜hy_place▁holder▁no▁813｜>计算位置"：把 MoE 挪到 CPU 在 decoded 稳态是净亏损
+   （见第 5 节），因为没有一个新的字节来源。
+
+## 时间线总览
+
+| 日期 | 目标 | 手段 | 结果（解码 t/s） | 状态 |
+|---|---|---|---|---|
+| 2026-09-17 | 把 SSD 专家读取跑满 | 路由专家预取并行化 + 滑动窗口补位 | V4.1 Q2：1.93 → **3.80** | 已实现 |
+| 2026-09-17 | （评估）能否压缩权重省流量 | Q2 张量熵 / 编解码器评估 | 最多省 ~7%，GPU 解压反而更慢 | 否决 |
+| 2026-09-17 | （评估）MoE 放 CPU 计算 | ds4 CPU 后端 / llama.cpp / 带宽实测 | CPU 后端 0.06 t/s，上限约 2 倍 | 否决 |
+| 2026-09-18 | 腾出显存 | `--host-offload-token-embd` | 显存 −1.2 GiB，速度不变 | 已实现 |
+| 2026-09-18 | 消灭整块落盘读 | `--ram-resident-experts`（全量常驻 pinned 池） | V4 Flash IQ2XXS：7.22 → **13.02** | 已实现 |
+| 2026-09-18 | （评估）SSD→内存跨层预取 | 盘带宽 / 放大倍数核算 | 增益 ≈ 0（解码已在盘带宽上限） | 否决 |
+| 2026-09-18 | 覆盖「装不进内存」的模型 | 读透式主机专家缓存 | 估算 3.80 → ~6.9 | **计划已存档，未实施** |
+
+## 1. 2026-09-17 — 路由专家预取并行化（V4.1 Flash Q2）
+
+**目标**：每 token 要搬 40 层 × 6 专家 × 9.49 MiB = 2.28 GB，单个 `pread` 只有约 5 GB/s，
+把整条 token 时间占满。想把盘的实际供给能力榨出来。
+
+**做法**
+
+- 每个 reader 一个 staging buffer / 完成事件 / 槽位，请求按 gate→up→down 逐张量连续下发。
+- 分批栅栏改为**滑动窗口**：谁回来就立刻上拷并立刻补下一个请求，读队列始终填满。
+- 默认并发 8（扫过 4/6/8/10/12/16，8 为峰值）；`DS4_CUDA_EXPERT_READ_DEPTH` 覆盖，上限 32；
+  `DS4_CUDA_DISABLE_EXPERT_PARALLEL_READ=1` 退回串行（**也是所有后续对比的基线**）。
+- 缓存 reserve 从固定 8 GiB 改为随显存缩放（1/8 显存，夹在 1–8 GiB 且 ≤ 1/4 显存）。
+- `make cuda` 未给 `CUDA_ARCH` 时用 `nvidia-smi` 自动探测（本机 sm_120）。
+
+**实测**
+
+| 专家暂存方式 | prefill t/s | 解码 t/s |
+|---|---|---|
+| 串行 pread（基线） | 2.78 | 1.93 |
+| 分批栅栏 @16 | 4.43 | 3.21 |
+| 滑动窗口 @8（当前默认） | **6.01** | **3.80** |
+
+**结论**：机制判据被修正——单个 pread 约 5 GB/s，但多个重叠 pread 在同一块盘上可到约 13 GB/s；
+真正的"墙"先是队列深度，深度给足后才碰到设备带宽。>8 并发不再有增益，更多并发只是多占 pinned 内存。
+
+## 2. 2026-09-18 — `--host-offload-token-embd`
+
+**目标**：token_embd（1.23 GiB）每 token 只做一次约 10 KB 的行 gather，却整块占着显存；
+把它搬到 pinned 主机内存应能腾出约 1.2 GiB。
+
+**做法**：显式 `cudaHostAlloc` + `cudaHostGetDevicePointer`（UVA 指针）。
+本机对模型 mmap 做 `cudaHostRegister` 的 zero-copy 通道**静默失败**并回落成 `cudaMalloc`+拷贝
+（`DS4_CUDA_NO_FD_CACHE=1` 时所有 range 都打印 `CUDA cached`，无 `CUDA mapped`），所以不能复用它。
+
+**实测**：显存 7.86 → 6.87 GiB；解码 8.31 → 8.21（噪声内）。`--temp 0` 输出逐 token 一致。
+
+**结论与边界**
+
+- 只有**行/列 gather**的张量适合这样卸载；被 GEMV 整块读的权重不行（`engram_kv` 每层 300 MiB，
+  卸载等于每 token 多走约 600 MiB PCIe，约耗 8% 的 token 预算）。
+- 释放出来的 1.2 GiB **不会变成更多专家槽**（规划器按显存总量估算），实际价值是上下文/prefill/OOM 余量。
+
+## 3. 2026-09-18 — `--ram-resident-experts`：内存常驻 pinned 专家池
+
+**目标**：只要可用主机内存装得下**全部**路由专家权重，就把它们一次性 pread 进 pinned 主机内存池，
+此后这些层的专家"读取"变成 pinned→显存的 `cudaMemcpyAsync`，完全不碰盘。
+
+**做法**
+
+- 判断口径：`MemAvailable − CmaFree` 减去预留（总内存 1/8，夹在 4..16 GiB）≥ 全部路由专家
+  （gate/up/down）——**装不下就整个忽略**，不做部分常驻（不可换出的大块内存换不可预测的命中率不划算）。
+- 池按文件偏移索引（排序 + 二分），独立于 `g_host_ranges`；分配用 `cudaHostAlloc`
+  **不带 `cudaHostAllocMapped`**（否则产生 device 别名，内核会逐字节走 PCIe）。
+- 预载按偏移排序、8 MiB 块、16 线程并行 pread；GGUF 专家张量偏移只有 512 字节对齐，
+  未对齐的头/尾必须走 page cache，否则 O_DIRECT 全部失效（这一步把预载从 6.5 提到 7.7 GB/s）。
+- 挂钩点：`cuda_stream_copy_worker`（前台逐专家，命中 → `payload` 直接给出，跳过 pread）
+  与 `cuda_stream_prefetch_read`（后台整层预取，命中 → 直拷 H2D）。
+
+**实测**（同一 prompt，`--temp 0 -n 96`）
+
+| 模型 / 配置 | 解码 t/s |
+|---|---|
+| V4 Flash IQ2XXS，512 槽，池关闭 | 7.22 |
+| V4 Flash IQ2XXS，512 槽，池自动启用 | **13.02** |
+| V4.1 Flash Q2，41 槽（专家 142.38 GiB 装不下，忽略） | 3.86（与关闭时一致） |
+
+预载 72.56 GiB 用 10.0 s（7.7 GB/s），已达裸盘 O_DIRECT 顺序读 8.7 GB/s 的约 90%；
+线程数 8/16/32 → 11.9 / 10.0 / 10.3 s，默认 16。理论上限 17 t/s（H2D 28.6 GB/s），实测 13.02。
+
+**勘误**：早期的 changelog 记录称"后台整层预取是解码速度的主要来源"是错的。
+`ds4_gpu_stream_expert_cache_prefetch` 只在 **prefill** 中被调用，且要求 `total_count >= 2048`
+（`ds4.c:41713`，注释写明低于 2K 时无用读取超过收益）；解码真正受益的是
+`cuda_stream_copy_worker` 里的 host-pool 命中直拷。
+
+## 4. 2026-09-18 —（评估否决）SSD→内存跨层异步预取
+
+提议："GPU 计算时把路由权重先搬到主机内存"。核算：
+
+- Q2 每 token 2.39 GB，解码 3.80 t/s → **9.07 GB/s**，已等于本盘实际供给（裸盘 8.7 GB/s，池预载 7.7 GB/s）。
+  盘没有空转时间 → 提前搬不会产生新字节，收益 ±5% 以内。
+- GPU 每 token 实际计算仅约 20 ms（7.07 GiB 常驻 @ ~450 GB/s ≈ 16 ms），对比 263 ms 的 token 时间 → 瓶颈 100% 在盘。
+- 跨层预取不可行：L+1 的 top-6 依赖 L 的残差输出；整层预读是 **62 倍放大**（3.56 GiB/层 vs 需要 57 MiB），
+  一层就要约 420 ms > 263 ms 的 token 预算。
+- 已佐证：读深度 16/24/32 → 3.78 / 2.98 / 2.96 t/s，深度不是瓶颈。
+
+## 5. 被评估否决的其他方向
+
+| 方向 | 关键数字 | 结论 |
+|---|---|---|
+| MoE 放 CPU（llama.cpp 风格） | ds4 CPU 后端同模型 0.06 t/s；内存带宽实测 34 GB/s；现实上限约 9–11 t/s（vs 当前 4.76） | 至多 2 倍，要写 llama.cpp 级内核；保留 SSD 读取只挪计算是净亏损（210 ms → 260–290 ms/token） |
+| 权重复化/无损压缩 | iq2_xxs 熵 7.94（上限 1.01x）、q2_k 7.81（1.03x）、q8_0 7.68（1.05x）；全部常驻非路由压到熵极限只省约 1 GiB ≈ +0.6% 流量 | 否决；GPU 熵解码几十 GB/s vs HBM 450 GB/s，比不压更慢 |
+| 扩大专家显存缓存 | 工作集约 15360 个专家，逐 token 复用率 ≈ 0 | 无收益 |
+| `--mtp` / `--dspark` | V4.1 CUDA 直接拒绝 | 不适用 |
+| 更大的并发/更深的暂存队列 | 见第 1 节与第 4 节 | 已到平台期，只是多占 pinned 内存 |
+
+## 6. 下一步目标
+
+见第 0 节的目标清单。唯一处于「计划」状态的一项是**读透式主机专家缓存**，
+完整的时间表、挂钩点、验收标准都在 [PLAN-host-expert-cache.md](PLAN-host-expert-cache.md)
+（已存档、未实施），这里不再复制，避免两处漂移。
+
+## 7. 实用命令速查
+
+```sh
+make cuda                                   # 不给 CUDA_ARCH 时自动探测（本机 sm_120）
+make tests/test_cuda_ssd_cache              # 改了 ds4_cuda.cu 必须单独重建测试，否则在跑旧代码
+
+# V4 Flash IQ2XXS（推荐：要扛长 prompt 就用 512 槽）
+./ds4 --cuda -m <IQ2XXS.gguf> --ssd-streaming --ssd-streaming-cache-experts 512 \
+      -c 4096 --prefill-chunk 512 --nothink -n 96
+
+# V4.1 Flash Q2（41 是槽位数，不是 GB）
+./ds4 --cuda -m <Q2.gguf> --ssd-streaming --ssd-streaming-cache-experts 41 \
+      -c 2048 --prefill-chunk 512 --nothink -n 64
+
+# 限制/关闭内存常驻专家池
+DS4_RAM_RESIDENT_EXPERTS=0 ./ds4 --cuda ...          # 等价于 --ram-resident-experts off
+./ds4 --cuda ... --ram-resident-experts 64GB          # 给池设上限（低于可用额度时才生效）
+
+# 把 token_embd 挪到 pinned 主机内存，腾出约 1.2 GiB 显存（行 gather 类张量专用）
+./ds4 --cuda ... --host-offload-token-embd
+
+# 串行基线（任何改动都跟它比）
+DS4_CUDA_DISABLE_EXPERT_PARALLEL_READ=1 ./ds4 --cuda ...
+# 扫一次读队列深度，确认本机峰值（本机 8）
+DS4_CUDA_EXPERT_READ_DEPTH=8 ./ds4 --cuda ...
+```
+
+**已知坑**
+
+- `--ssd-streaming-cache-experts` 写 `NGB` 会被解析成"再预留两个完整 prefill 层"，
+  结果只剩 1 个槽并报 `CUDA SSD cache cannot stage ... experts with system headroom`；要写**槽位数**。
+- 长 prompt 会为"每层 × 每个唯一路由专家"占槽：IQ2XXS 上 799 token 的 prompt 最多只能用 512 槽，
+  960 槽会 `gpu layer 33 ffn batch encode failed`；短 prompt 压测才能推到 960（约 9.2 t/s 上限）。
+- 默认采样不确定：只有 `--temp 0` 的前后对比才有意义。
+- `tests/test_cuda_ssd_cache` 在预取池出错时表现为**卡死**而不是报错，约 5 秒的回归比基准更早发现问题。

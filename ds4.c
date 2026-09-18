@@ -53,9 +53,10 @@
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
 #define DS4_HAS_QWEN4_METAL 1
 #endif
-#ifdef DS4_ROCM_BUILD
+/* Host-memory availability (MemAvailable minus CMA): the ROCm guard needs it,
+ * and so does the RAM-resident expert pool, which must decide before pinning
+ * tens of GiB. */
 #include "ds4_linux_memory.h"
-#endif
 
 #ifdef DS4_TEST_HOOKS
 static uint64_t ds4_test_ds41_native_evals;
@@ -3382,6 +3383,11 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
         if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
             (ds4_streq(t->name, "blk.1.engram_embd.weight") ||
              ds4_streq(t->name, "blk.14.engram_embd.weight"))) continue;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        /* Resident in host memory: merging it into a device span would both
+         * waste VRAM and alias neighbouring tensors to the host pointer. */
+        if (ds4_gpu_range_is_host_resident(m->map, t->abs_offset, t->bytes)) continue;
+#endif
         if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) {
             free(spans);
             return false;
@@ -8651,13 +8657,14 @@ static DS4_MAYBE_UNUSED uint64_t model_map_span_vec_total_bytes(
 
 static DS4_MAYBE_UNUSED bool weights_streaming_non_routed_bytes(
         const ds4_weights *w,
+        bool               exclude_token,
         uint64_t          *bytes_out) {
     if (bytes_out) *bytes_out = 0;
     if (!w || !bytes_out) return false;
 
     ds4_model_map_span_vec spans;
     const bool include_token =
-        weights_layer_has_required(&w->layer[0], 0);
+        !exclude_token && weights_layer_has_required(&w->layer[0], 0);
     if (!weights_model_map_decode_static_spans(w,
                                                include_token,
                                                weights_have_output_head(w),
@@ -42270,6 +42277,14 @@ struct ds4_engine {
     bool ssd_streaming_full_layers_set;
     bool ssd_streaming_budget_finalized;
     bool ssd_streaming_static_decode_map;
+    /* Set once the host-resident copy of token_embd is installed; excludes it
+     * from every device-memory figure derived from static weights. */
+    bool host_offload_token_embd;
+    bool token_embd_host_resident;
+    /* Routed experts pinned in host memory (CUDA SSD streaming). */
+    bool ram_resident_experts_off;
+    uint64_t ram_resident_experts_bytes;
+    bool expert_pool_installed;
     ds4_distributed_options distributed;
     ds4_engine_tp_state tp;
     bool metal_ready;
@@ -42390,6 +42405,11 @@ static void ds4_engine_print_startup_memory(
     const uint64_t expert_reserved_bytes =
         e->ssd_streaming_prefill_headroom_bytes;
     uint64_t resident_model_bytes = e->startup_model_span_bytes;
+    if (e->token_embd_host_resident && e->weights.token_embd &&
+        resident_model_bytes > e->weights.token_embd->bytes) {
+        /* Served from pinned host memory; never lands in an arena. */
+        resident_model_bytes -= e->weights.token_embd->bytes;
+    }
 #ifndef DS4_NO_GPU
     if (e->ssd_streaming_static_decode_map &&
         e->ssd_streaming_decode_map_bytes != 0) {
@@ -42403,7 +42423,9 @@ static void ds4_engine_print_startup_memory(
     }
     if (e->ssd_streaming && e->backend == DS4_BACKEND_METAL) {
         uint64_t static_bytes = 0;
-        if (weights_streaming_non_routed_bytes(&e->weights, &static_bytes) &&
+        if (weights_streaming_non_routed_bytes(&e->weights,
+                                               e->token_embd_host_resident,
+                                               &static_bytes) &&
             static_bytes > resident_model_bytes) {
             resident_model_bytes = static_bytes;
         }
@@ -42444,6 +42466,28 @@ static void ds4_engine_print_startup_memory(
             bright_green,
             ds4_bytes_to_gib(total),
             reset);
+
+    if (dynamic_expert_cache_bytes != 0) {
+        /* The slot count and its VRAM cost are the two numbers that decide how
+         * much of the routed set is served without a read, so state them
+         * outright instead of leaving them to be inferred. */
+        const uint32_t slots = ds4_gpu_stream_expert_cache_configured_count();
+        uint64_t per_expert = 0;
+        uint64_t cacheable = 0;
+        (void)ds4_streaming_routed_expert_bytes(&e->weights, &per_expert);
+        (void)ds4_streaming_cacheable_expert_count(&e->weights, &cacheable, NULL);
+        fprintf(stderr, "%sds4: expert cache: %u slots", green, slots);
+        if (per_expert != 0)
+            fprintf(stderr, " x %.2f MiB", (double)per_expert / 1048576.0);
+        fprintf(stderr, " = %.2f GiB VRAM", ds4_bytes_to_gib(dynamic_expert_cache_bytes));
+        if (cacheable != 0 && slots != 0)
+            fprintf(stderr, " (%.1f%% of %llu cacheable experts)",
+                    100.0 * (double)slots / (double)cacheable,
+                    (unsigned long long)cacheable);
+        if (e->expert_pool_installed)
+            fprintf(stderr, "; routed experts reside in pinned host memory");
+        fprintf(stderr, "%s\n", reset);
+    }
 
     fprintf(stderr,
             "%sds4: memory detail: ctx=%d prefill_cap=%u raw_kv_rows=%u "
@@ -67779,7 +67823,9 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e, int ctx_siz
     }
 
     uint64_t non_routed_bytes = 0;
-    if (!weights_streaming_non_routed_bytes(&e->weights, &non_routed_bytes)) {
+    if (!weights_streaming_non_routed_bytes(&e->weights,
+                                            e->token_embd_host_resident,
+                                            &non_routed_bytes)) {
         fprintf(stderr,
                 "ds4: SSD streaming auto cache could not measure non-routed model weights\n");
         return false;
@@ -70014,7 +70060,9 @@ static bool ds41_memory_admit_for_host(ds4_engine *e, uint64_t graph_bytes,
     }
     if (budget > recommended) budget = recommended;
     uint64_t weights = g_tp_shard_model_bytes ? g_tp_shard_model_bytes : e->model.size;
-    if (e->ssd_streaming && !weights_streaming_non_routed_bytes(&e->weights, &weights)) return false;
+    if (e->ssd_streaming && !weights_streaming_non_routed_bytes(&e->weights,
+                                                               e->token_embd_host_resident,
+                                                               &weights)) return false;
     weights = ds4_add_sat_u64(weights, e->vision_model.size);
     const uint64_t fixed = ds4_add_sat_u64(weights,
         ds4_add_sat_u64(graph_bytes, 2u * gib + e->ssd_streaming_prefill_headroom_bytes));
@@ -70052,10 +70100,99 @@ static bool ds41_memory_admit(ds4_engine *e, uint64_t graph_bytes, bool fit_cach
 }
 #endif
 
+/* CUDA SSD streaming: when the routed expert weights fit in host memory next to
+ * a reserve, pin them once at startup so every staged read becomes a
+ * host-to-device copy. The cache, the slots and the kernels are untouched --
+ * only where the bytes come from changes. All-or-nothing: a partial pool would
+ * trade a large, unswappable allocation for an unpredictable hit rate. */
+static void ds4_engine_install_expert_host_pool(ds4_engine *e) {
+#if defined(DS4_NO_GPU) || defined(__APPLE__) || defined(DS4_ROCM_BUILD)
+    (void)e;
+#else
+    if (!e || !e->ssd_streaming || e->backend != DS4_BACKEND_CUDA) return;
+    if (e->distributed.role != DS4_DISTRIBUTED_NONE || e->cuda_tensor_parallel) return;
+    if (e->ram_resident_experts_off) {
+        fprintf(stderr, "ds4: RAM-resident experts: disabled by --ram-resident-experts off\n");
+        return;
+    }
+    const uint64_t gib = UINT64_C(1073741824);
+    uint64_t *offsets = xcalloc(3u * (size_t)DS4_N_LAYER, sizeof(uint64_t));
+    uint64_t *bytes = xcalloc(3u * (size_t)DS4_N_LAYER, sizeof(uint64_t));
+    uint32_t count = 0, layers = 0;
+    uint64_t total = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        /* Mixed-precision layers never enter the slab cache, so a resident copy
+         * of them could not be served from it either. */
+        if (!weights_streaming_layer_experts_uniform(&e->weights, il)) continue;
+        const ds4_layer_weights *l = &e->weights.layer[il];
+        if (!l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps) continue;
+        const ds4_tensor *t[3] = { l->ffn_gate_exps, l->ffn_up_exps, l->ffn_down_exps };
+        uint64_t add = 0;
+        for (unsigned k = 0; k < 3; k++) {
+            if (t[k]->bytes == 0) { add = 0; break; }
+            if (add > UINT64_MAX - t[k]->bytes) { add = 0; break; }
+            add += t[k]->bytes;
+        }
+        if (add == 0) continue;
+        for (unsigned k = 0; k < 3; k++) {
+            offsets[count] = t[k]->abs_offset;
+            bytes[count] = t[k]->bytes;
+            count++;
+        }
+        total += add;
+        layers++;
+    }
+    if (layers == 0 || count == 0) {
+        free(offsets);
+        free(bytes);
+        return;
+    }
+
+    uint64_t host_total = 0;
+    const long pages = sysconf(_SC_PHYS_PAGES), page_size = sysconf(_SC_PAGESIZE);
+    if (pages > 0 && page_size > 0 &&
+        (uint64_t)pages <= UINT64_MAX / (uint64_t)page_size)
+        host_total = (uint64_t)pages * (uint64_t)page_size;
+    uint64_t host_avail = 0;
+    if (!ds4_linux_nonmovable_memory(&host_avail) || host_avail == 0)
+        host_avail = host_total;
+    /* Scale the reserve with the machine instead of hardcoding a number: a
+     * pinned pool cannot be swapped out, so the rest of the system needs a
+     * share proportional to what it has. */
+    uint64_t reserve = host_total / 8u;
+    if (reserve < 4u * gib) reserve = 4u * gib;
+    if (reserve > 16u * gib) reserve = 16u * gib;
+    uint64_t usable = host_avail > reserve ? host_avail - reserve : 0;
+    if (e->ram_resident_experts_bytes != 0 && e->ram_resident_experts_bytes < usable)
+        usable = e->ram_resident_experts_bytes;
+
+    if (total > usable) {
+        fprintf(stderr,
+                "ds4: RAM-resident experts: disabled - %.2f GiB of routed experts "
+                "exceeds %.2f GiB usable host memory (MemAvailable %.2f GiB, "
+                "reserve %.2f GiB)\n",
+                ds4_bytes_to_gib(total), ds4_bytes_to_gib(usable),
+                ds4_bytes_to_gib(host_avail), ds4_bytes_to_gib(reserve));
+        free(offsets);
+        free(bytes);
+        return;
+    }
+    if (ds4_gpu_expert_pool_install(e->model.map, e->model.size,
+                                    offsets, bytes, count)) {
+        e->expert_pool_installed = true;
+        fprintf(stderr,
+                "ds4: RAM-resident experts: %u of %u routed layers pinned in host "
+                "memory (%.2f GiB); their staged reads are now host-to-device copies\n",
+                layers, (uint32_t)DS4_N_LAYER, ds4_bytes_to_gib(total));
+    }
+    free(offsets);
+    free(bytes);
+#endif
+}
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     return ds4_engine_open_internal(out, opt, NULL);
 }
-
 int ds4_engine_create_with_gpu_config(ds4_engine **out,
                                        const ds4_engine_options *opt,
                                        const struct ds4_gpu_config *gpu_cfg) {
@@ -70085,6 +70222,13 @@ static int ds4_engine_open_internal(ds4_engine **out,
     e->ssd_streaming = opt->ssd_streaming;
     e->ssd_streaming_cold = opt->ssd_streaming_cold;
     e->ssd_streaming_full_layers_set = opt->ssd_streaming_full_layers_set;
+    e->host_offload_token_embd = opt->host_offload_token_embd;
+    e->ram_resident_experts_off = opt->ram_resident_experts_off;
+    e->ram_resident_experts_bytes = opt->ram_resident_experts_bytes;
+    if (getenv("DS4_RAM_RESIDENT_EXPERTS") != NULL) {
+        const char *v = getenv("DS4_RAM_RESIDENT_EXPERTS");
+        e->ram_resident_experts_off = (v[0] == '0' || v[0] == '\0');
+    }
     e->distributed = opt->distributed;
     e->power_percent = opt->power_percent > 0 ? opt->power_percent : 100;
     if (opt->vision_path && opt->vision_path[0]) {
@@ -70869,6 +71013,18 @@ static int ds4_engine_open_internal(ds4_engine **out,
         ds4_gpu_set_quality(e->quality);
         ds4_gpu_set_glm_model(DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA);
         ds4_gpu_set_ssd_streaming(e->ssd_streaming);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        /* Must precede every model span build and every weight residency
+         * figure, so the range is neither copied into an arena nor counted
+         * against the expert cache budget. */
+        if (e->host_offload_token_embd && e->weights.token_embd) {
+            const ds4_tensor *te = e->weights.token_embd;
+            e->token_embd_host_resident =
+                ds4_gpu_set_host_resident_range(e->model.map, e->model.size,
+                                                te->abs_offset, te->bytes,
+                                                "token_embd") != 0;
+        }
+#endif
         if (!ds4_engine_configure_streaming_auto_cache(e, opt->context_size)) {
             ds4_engine_close(e);
             *out = NULL;
@@ -70929,7 +71085,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
                     ds4_add_sat_u64(e->ssd_streaming_prefill_headroom_bytes,
                                    e->ssd_streaming_full_layer_bytes));
             const bool fits =
-                weights_streaming_non_routed_bytes(&e->weights, &static_bytes) &&
+                weights_streaming_non_routed_bytes(&e->weights,
+                                                   e->token_embd_host_resident,
+                                                   &static_bytes) &&
                 static_bytes <= budget && experts <= budget - static_bytes;
             if (!fits) {
                 fprintf(stderr, "ds4: Metal SSD static weights remain pageable"
@@ -71336,6 +71494,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
 #endif
 
     if (!opt->inspect_only) {
+        ds4_engine_install_expert_host_pool(e);
         ds4_engine_print_startup_memory(e, opt->context_size);
     }
     *out = e;

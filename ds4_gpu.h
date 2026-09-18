@@ -197,6 +197,14 @@ int ds4_gpu_set_aux_model_map_range(const void *model_map,
                                     uint64_t map_size);
 int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint64_t *sizes, uint32_t count, uint64_t max_tensor_bytes);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
+/* CUDA only: serve a model range from pinned host memory (zero device memory).
+ * Returns 0 when pinned memory or its zero-copy pointer is unavailable, in
+ * which case the caller keeps the range resident as usual. */
+int ds4_gpu_set_host_resident_range(const void *model_map, uint64_t model_size,
+                                    uint64_t offset, uint64_t bytes,
+                                    const char *label);
+int ds4_gpu_range_is_host_resident(const void *model_map, uint64_t offset,
+                                   uint64_t bytes);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 int ds4_gpu_q8_cache_suppressed(void);
 void ds4_gpu_set_q8_cache_suppressed(int suppressed);
@@ -289,6 +297,15 @@ int ds4_gpu_stream_expert_cache_prefetch(
         const ds4_gpu_stream_expert_table *current,
         const ds4_gpu_stream_expert_table *next);
 void ds4_gpu_stream_expert_cache_prefetch_finish(bool cancel);
+/* Pin routed expert weights in host memory so staged reads become
+ * host-to-device copies. Returns 1 once every range is resident. */
+int ds4_gpu_expert_pool_install(const void *model_map,
+                                uint64_t model_size,
+                                const uint64_t *offsets,
+                                const uint64_t *bytes,
+                                uint32_t count);
+void ds4_gpu_expert_pool_release(void);
+uint64_t ds4_gpu_expert_pool_bytes(void);
 #endif
 /* Reset only the prompt-local eviction heuristic.  The resident SSD expert
  * cache itself is intentionally kept warm across sessions. */

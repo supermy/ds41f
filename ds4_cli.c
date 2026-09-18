@@ -2060,6 +2060,20 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.ssd_streaming = true;
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
             c.engine.ssd_streaming_cold = true;
+        } else if (!strcmp(arg, "--host-offload-token-embd")) {
+            c.engine.host_offload_token_embd = true;
+        } else if (!strcmp(arg, "--ram-resident-experts")) {
+            const char *value = need_arg(&i, argc, argv, arg);
+            if (!strcmp(value, "off") || !strcmp(value, "0")) {
+                c.engine.ram_resident_experts_off = true;
+            } else if (!strcmp(value, "auto") || !strcmp(value, "on") ||
+                       !strcmp(value, "1")) {
+                c.engine.ram_resident_experts_off = false;
+            } else if (!ds4_parse_gib_arg(value, &c.engine.ram_resident_experts_bytes)) {
+                fprintf(stderr,
+                        "ds4: --ram-resident-experts must be off, auto, or <number>GB\n");
+                exit(2);
+            }
         } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
             uint32_t experts = 0;
             uint64_t bytes = 0;

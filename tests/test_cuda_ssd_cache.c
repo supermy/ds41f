@@ -243,6 +243,66 @@ static void run(unsigned gate_type, unsigned down_type, unsigned dim, unsigned s
                   2e-5f * (1 + fabsf(reference[0][first_row * dim + i])));
     }
     fprintf(stderr, "CUDA SSD consecutive prefill chunks refresh IDs and preserve output bounds: PASS\n");
+    /* Routed experts pinned in host memory. With the source file emptied, both
+     * the demand load and the independent whole-layer read-ahead must still
+     * reproduce the reference output, which is only possible from the pool. */
+    {
+        uint64_t pool_offsets[3 * LAYERS], pool_bytes[3 * LAYERS];
+        for (unsigned l = 0; l < LAYERS; l++) {
+            pool_offsets[3 * l + 0] = l * layer_bytes;
+            pool_offsets[3 * l + 1] = l * layer_bytes + EXPERTS * gate_bytes;
+            pool_offsets[3 * l + 2] = l * layer_bytes + 2 * EXPERTS * gate_bytes;
+            pool_bytes[3 * l + 0] = EXPERTS * gate_bytes;
+            pool_bytes[3 * l + 1] = EXPERTS * gate_bytes;
+            pool_bytes[3 * l + 2] = EXPERTS * down_bytes;
+        }
+        CHECK(ds4_gpu_tensor_write(x, 0, input, sizeof(input)));
+        CHECK(ds4_gpu_tensor_write(si, 0, ids, sizeof(ids)));
+        /* The pool is filled from the file, so restore it before installing. */
+        CHECK(pwrite(fd, model, model_bytes, 0) == (ssize_t)model_bytes);
+        CHECK(ds4_gpu_expert_pool_install(alias, model_bytes,
+                                          pool_offsets, pool_bytes, 3 * LAYERS));
+        CHECK(ds4_gpu_expert_pool_bytes() == model_bytes);
+        ds4_gpu_stream_expert_cache_release_resident();
+        CHECK(ftruncate(fd, 0) == 0);
+        ds4_gpu_set_streaming_expert_cache_budget(2u * EXPERTS);
+        CHECK(ds4_gpu_stream_expert_cache_begin_selected_load(&cached, all, EXPERTS));
+        bool pool_half = false;
+        CHECK(ds4_gpu_routed_moe_batch_tensor(out, gate, up, mid, down, alias, model_bytes,
+            0, EXPERTS * gate_bytes, 2 * EXPERTS * gate_bytes,
+            gate_type, down_type, gate_bytes, gate_block, down_bytes, down_block,
+            dim, dim, dim, si, sw, EXPERTS, selected, 10, x, 0, ROWS, &pool_half, false));
+        CHECK(!pool_half && ds4_gpu_tensor_read(out, 0, actual, sizeof(actual)));
+        for (unsigned i = 0; i < ROWS * dim; i++)
+            CHECK(isfinite(actual[i]) && fabsf(actual[i] - reference[0][i]) <=
+                  2e-5f * (1 + fabsf(reference[0][i])));
+        ds4_gpu_stream_expert_cache_release_resident();
+        ds4_gpu_set_streaming_expert_cache_budget(3u * EXPERTS);
+        ds4_gpu_stream_expert_table pool_current = cached;
+        pool_current.layer = 1;
+        pool_current.gate_offset += layer_bytes;
+        pool_current.up_offset += layer_bytes;
+        pool_current.down_offset += layer_bytes;
+        /* A budget change tears the cache down, so one pool-served load has to
+         * rebuild the slots the read-ahead reserves. */
+        CHECK(ds4_gpu_stream_expert_cache_begin_selected_load(&pool_current, all, EXPERTS));
+        const int started = ds4_gpu_stream_expert_cache_prefetch(&pool_current, &cached);
+        CHECK(started || (fprintf(stderr, "pool prefetch did not start\n"), 0));
+        ds4_gpu_stream_expert_cache_prefetch_finish(false);
+        pool_half = false;
+        CHECK(ds4_gpu_routed_moe_batch_tensor(out, gate, up, mid, down, alias, model_bytes,
+            0, EXPERTS * gate_bytes, 2 * EXPERTS * gate_bytes,
+            gate_type, down_type, gate_bytes, gate_block, down_bytes, down_block,
+            dim, dim, dim, si, sw, EXPERTS, selected, 10, x, 0, ROWS, &pool_half, false));
+        CHECK(!pool_half && ds4_gpu_tensor_read(out, 0, actual, sizeof(actual)));
+        for (unsigned i = 0; i < ROWS * dim; i++)
+            CHECK(isfinite(actual[i]) && fabsf(actual[i] - reference[0][i]) <=
+                  2e-5f * (1 + fabsf(reference[0][i])));
+        ds4_gpu_expert_pool_release();
+        CHECK(ds4_gpu_expert_pool_bytes() == 0);
+        CHECK(pwrite(fd, model, model_bytes, 0) == (ssize_t)model_bytes);
+        fprintf(stderr, "CUDA SSD host-resident expert pool serves loads and read-ahead: PASS\n");
+    }
     ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(sw); ds4_gpu_tensor_free(si);
     ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(gate); ds4_gpu_tensor_free(up);
     ds4_gpu_tensor_free(mid); ds4_gpu_tensor_free(down);
