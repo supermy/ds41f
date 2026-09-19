@@ -68,17 +68,64 @@
 
 ### GLM 5.3 Flash Q2（89.88 GiB，路由专家 81.63 GiB）
 
-| 阶段 | 解码 t/s | prefill t/s | 相对上一步 |
-|---|---|---|---|
-| 上游基线 | 1.57 | 2.64 | — |
-| + 并行预取 | 3.82 | 5.60 | **2.43×** |
-| + 读透缓存（默认预留下差 2.6 GiB 装不下） | 6.07 | 5.43 | **1.59×** |
-| + 压低预留使其全量常驻（`RESERVE_MB=6144`） | **7.20** | 7.51 | **1.19×** |
+模型参数：46 层、每层 288 专家、每 token 约 2.61 GB（46 层中 43 层是均匀层，可进常驻池）。
+全部四档都实测过，同一 prompt、`--temp 0 -n 128`：
 
-**合计 1.57 → 7.20 = 4.59×**。落盘字节 310 → 89 GiB（−71%）。
-全常驻后瓶颈不是搬运而是它自己的 attention：GLM 走 `full-attention argmax` 路径（不是压缩 KV），
-且 46 层里只有 43 层进池（3 层是混合精度层）。同样全常驻，V4 Flash 能到 PCIe 的 97%，
-GLM 只到 65%。
+| 阶段 | 解码 t/s | prefill t/s | 落盘 GiB | 命中率 | 相对上一步 |
+|---|---|---|---|---|---|
+| 上游基线 | 1.57 | 2.64 | 310 | — | — |
+| + 并行预取 | 3.82 | 5.58 | 310 | — | **2.43×** |
+| + 读透缓存（默认 26 GiB 预算） | 6.07 | 5.43 | 98 | 70.2% | **1.59×** |
+| + 压低预留使其全量常驻（`RESERVE_MB=6144`） | **7.20** | 7.51 | 89 | — | **1.19×** |
+
+**合计 1.57 → 7.20 = 4.59×**，落盘字节 310 → 89 GiB（−71%）。（重复运行落在 6.06–6.07，
+噪声约 ±0.02。）
+
+三个从数字里读出来的事实：
+
+1. **并行预取那一档落盘字节一点没少**（310 GiB 和基线相同），速度却 2.43×。
+   这跟 V4.1 上看到的是同一件事：瓶颈先是**读队列深度**，不是盘的带宽。
+   盘一直在以同样的字节量供给，只是不再空等。
+2. **读透缓存削掉的是字节**（310 → 98 GiB，−68%），命中率 70.2%，
+   212.63 GiB 从内存供给、90.18 GiB 仍走盘。
+3. **全常驻后剩下的 89 GiB 里绝大部分是启动那次预载**（81.63 GiB，11.8 s @ 7.5 GB/s），
+   解码阶段几乎不再碰盘。
+
+**为什么全常驻只到 7.20，而不是按 PCIe 算的 11.0**：`2.61 GB ÷ 28.6 GB/s = 91 ms`
+只算了搬字节，实测 139 ms/token，多出的 48 ms 有据可查——
+
+- 46 层里只有 **43 层进池**，3 层是混合精度层，不进 slab 缓存也就进不了池，
+  它们的流量（约 6.5% ≈ 0.17 GB/token）仍要走盘，约 17 ms。
+- GLM 走 `full-attention argmax generation path`（日志里写明），不是 DeepSeek 的压缩 KV 路径，
+  attention 侧的 GPU 开销更大，约 30 ms。
+
+也就是说**盘踢出去之后，GLM 的瓶颈是它自己的 attention 计算**，不是搬运。
+同样的全常驻待遇，V4 Flash 能贴到 PCIe 的 97%，GLM 只到 65%。
+
+**复现**（GLM 在本机有两个坑，见下）：
+
+```sh
+G=<GLM53-Q2.gguf>; P="Explain what mmap is, briefly."
+BASE='DS4_CUDA_DISABLE_EXPERT_PARALLEL_READ=1 DS4_RAM_RESIDENT_EXPERTS=0 DS4_HOST_EXPERT_CACHE=off'
+PAR='DS4_RAM_RESIDENT_EXPERTS=0 DS4_HOST_EXPERT_CACHE=off'
+COMMON=(-m "$G" --cuda --ssd-streaming -c 2048 --nothink --temp 0 -n 128 -p "$P")
+
+bash -c "$BASE DS4_GLM_MEMORY_GUARD=0 ./ds4 \"\${@}\"" _ "${COMMON[@]}"   # 1.57
+bash -c "$PAR  DS4_GLM_MEMORY_GUARD=0 ./ds4 \"\${@}\"" _ "${COMMON[@]}"   # 3.82
+DS4_GLM_MEMORY_GUARD=0 ./ds4 "${COMMON[@]}"                              # 6.07
+DS4_GLM_MEMORY_GUARD=0 DS4_RAM_RESIDENT_RESERVE_MB=6144 ./ds4 "${COMMON[@]}"   # 7.20
+```
+
+**GLM 在本机的两个坑**
+
+- 不加 `DS4_GLM_MEMORY_GUARD=0` 会被守卫拒掉：它要预留 32 GiB，16 GiB 卡上预算直接算成 0
+  （`GLM memory guard refused ctx=2048 ... reserve 32.00 GiB`）。
+- **不接受 `--prefill-chunk`**（"GLM uses graph-selected prefill chunks"）；`-c` 大小对速度无影响
+  （512 与 2048 都是 6.06–6.09 t/s）。
+
+**压预留的代价**：pin 完 81.63 GiB 后系统只剩约 9 GiB 给页缓存和其他进程。
+`ds4` 把自己的 `oom_score_adj` 设成 1000，真到 OOM 时先被杀的是它。
+预留 6 GiB 与 8 GiB 都能装下且速度相同（都是 7.20 t/s），具体留多少看机器上还要跑什么。
 
 ## 各项优化的目标与为什么有效
 
