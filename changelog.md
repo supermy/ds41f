@@ -23,9 +23,16 @@ undefined reference to `ds4_gpu_stream_expert_cache_configured_count'   # ds4.c:
 预期管理（模型 45–340 GiB，手机内存跑不动）、四条路线选择（Debian+NVIDIA / 纯 CPU /
 Termux / Mac）、逐步命令、CodeBuddy 用法、成功检查清单、排错表、下一步读什么。
 
-**Termux 那段未验证**：手上没有 Android 设备，那段基于"Android 是 Linux 内核、
-有 mmap 与 pthread"的通用步骤写成，文档里已明确标注，并给了
-`make cpu NATIVE_CPU_FLAG=` 这一规避（ARM 上 `-march=native` 常出问题）。
+**Termux 的定位已更正为"移动办公的登录端"**：手机/平板的 Termux **不用来构建**
+（45 GiB 起的模型与 8–16 GB 内存凑不到一起），而是 SSH 回 Debian 台式机干活。
+教程相应重写：Termux 装 openssh/mosh，台式机开 `sshd` 并装 mosh/tmux，
+密钥登录 + `~/.ssh/config` 别名，长任务一律放 tmux（断网重连后 `tmux attach` 还在），
+移动网络用 mosh（UDP 60000–61000），不在同一局域网时走 Tailscale/WireGuard 而不是裸暴露 SSH。
+台式机侧已在这台机器上确认：`openssh-server` 已装、`sshd` 为 active、局域网 IP `192.168.0.168`
+（无线网卡 DHCP，文档里提醒去路由器绑静态 IP，否则重启后会变）。
+
+**Termux 自身那段仍未验证**：手上没有 Android 设备。SSH/mosh/tmux 的用法是通用的，
+但"熄屏被杀、电池优化白名单、termux-wake-lock"这类来自它的常见行为，文档里已标注。
 
 **改动位置**：`ds4.c`、`docs/DEV_ENV_SETUP.md`（新）、`README.md`、`README_CN.md`、`changelog.md`。
 

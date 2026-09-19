@@ -12,9 +12,11 @@
 | 事实 | 含义 |
 | --- | --- |
 | 模型体积 45 GiB ~ 340 GiB | 磁盘要够大，下载要花时间 |
-| 最小模型也要 45 GiB | **手机/平板（8–16 GB 内存）跑不动**，Termux 只能当开发环境 |
+| 最小模型也要 45 GiB | **手机/平板（8–16 GB 内存）跑不动**，别指望在平板上推理 |
 | 推理速度单位是 t/s | 每秒生成的 token 数；CPU 后端实测约 0.06 t/s，慢到没法聊天 |
-| 真正好用的配置 | NVIDIA 显卡 + 96 GB 级内存 + 快 NVMe，或 96 GB+ 的 Mac（Metal） |
+| 典型分工 | **Debian 台式机**负责构建和运行；**手机/平板的 Termux 负责 SSH 回来干活** |
+
+本文按这个分工写：台式机是主力，Termux 是移动办公的登录端。
 
 本 fork（`supermy/ds41f`）相对上游 [antirez/ds4](https://github.com/antirez/ds4) 只多做一件事：
 把 **CUDA 单卡上的 SSD 流式推理**推到带宽上限。上游的主战场是 Metal（Mac）与 DGX Spark。
@@ -22,14 +24,18 @@
 
 ## 1. 先选一条路
 
-| 你的设备 | 构建目标 | 能跑真实模型吗 |
-| --- | --- | --- |
-| Debian/Ubuntu + NVIDIA 显卡 | `make cuda` | ✅ 能，带本 fork 的全部优化 |
-| Debian/Ubuntu 只有 CPU / 虚拟机 / CI | `make cpu` | ⚠️ 能跑但极慢（0.06 t/s），适合验证流程 |
-| 手机 / 平板 Termux | `make cpu` | ❌ 内存不够，只能编译和跑测试 |
-| Mac（Apple Silicon，96 GB+） | `make` | ✅ 上游主战场（本 fork 没改 Metal） |
+| 你的设备 | 角色 | 构建目标 | 能跑真实模型吗 |
+| --- | --- | --- | --- |
+| **Debian 台式机 + NVIDIA 显卡** | 开发 + 运行主力 | `make cuda` | ✅ 能，带本 fork 的全部优化 |
+| Debian 台式机只有 CPU | 开发 + 流程验证 | `make cpu` | ⚠️ 能跑但极慢（0.06 t/s） |
+| **手机 / 平板 Termux** | **移动办公的登录端**（SSH 回台式机） | 不在这上面构建 | ❌ 内存不够 |
+| Mac（Apple Silicon，96 GB+） | 上游主战场 | `make` | ✅（本 fork 没改 Metal） |
+
+Termux 那段说的是"怎么在手机上连回台式机干活"，不是"怎么在手机上编译"。
 
 ## 2. 通用第一步：拿代码
+
+在**台式机**上执行（Termux 不参与这一步，它是拿来登录的）：
 
 ```sh
 git clone https://github.com/supermy/ds41f.git    # 本 fork
@@ -39,7 +45,11 @@ cd ds41f
 想跟上游就 `git clone https://github.com/antirez/ds4.git`。
 想给上游提改动前先读 [CONTRIBUTING.md](../CONTRIBUTING.md)。
 
-## 3. Debian / Ubuntu 服务器
+## 3. Debian 台式机（开发 + 运行主力）
+
+这一段在你那台装 Debian/Ubuntu 的台式机上做。有 NVIDIA 显卡就走 3.2，没有就走 3.3；
+两边的第 3.4~3.5 是通用的。想在外面用手机 SSH 回来干活的，顺手把第 4 节的 4.2
+（台式机开 SSH）也做一下。
 
 ### 3.1 装基础工具
 
@@ -101,30 +111,95 @@ ls -la gguf/
 
 想接 Pi / OpenCode / Codex CLI / Claude Code 看 [docs/CLIENTS.md](CLIENTS.md)。
 
-## 4. Termux（手机 / 平板）
+## 4. Termux：移动办公的登录端
 
-> **这一段我无法验证** —— 手上没有 Android 设备。它建立在"Android 是 Linux 内核、
-> 有 `mmap` 和 pthread"这一事实上，步骤是通用的。遇到报错请把错误信息发出来。
+手机/平板的 Termux 在这里**不负责构建**——45 GiB 起的模型和它 8–16 GB 的内存凑不到一起。
+它的活是：你人在外面时，SSH 回台式机，接着干活。编译、下载、跑模型都在台式机上。
+
+### 4.1 手机上装什么
 
 ```sh
 pkg update
-pkg install -y git clang make
-git clone https://github.com/supermy/ds41f.git
-cd ds41f
-
-# ARM 上 gcc/clang 经常认不出 -march=native，置空最稳
-make cpu NATIVE_CPU_FLAG=
-./ds4 --help
+pkg install -y openssh mosh git
 ```
 
-**能做的**：
+* `openssh`：`ssh` / `ssh-keygen` / `ssh-copy-id`
+* `mosh`：比 ssh 更扛移动网络——切 WiFi/4G、IP 变了也不掉线
+* `git`：想直接在手机上改点小东西时用（可选）
 
-- 编译验证——改了代码能编过，这在手机上就够了
-- 跑不依赖模型的测试：`make ds4_test && ./ds4_test --server`
-- 读代码、学结构（[AGENT.md](../AGENT.md) 有模块说明）
+`tmux` 要装在**台式机**上，不是手机上（会话保持跑在远端，见 4.4）。
 
-**做不到的**：跑真实模型（内存不够）、GPU 加速（Termux 上没有 CUDA / Metal）。
-想在手机上真跑起来，请换 96 GB 内存的机器或用服务器。
+### 4.2 台式机上开好门（只做一次）
+
+```sh
+sudo apt install -y openssh-server mosh tmux
+sudo systemctl enable --now ssh          # 开机自启
+ip -4 addr show scope global             # 记下局域网 IP
+systemctl is-active ssh                  # 确认是 active
+```
+
+> 我这台机器上是 `192.168.0.168`（无线网卡，DHCP 分的）。**建议去路由器把 MAC 和 IP 绑死**，
+> 否则重启后 IP 变了你就连不上了。想用名字而不是 IP，可以装 avahi 用 `主机名.local`。
+
+### 4.3 用密钥登录，别用密码
+
+在 Termux 上：
+
+```sh
+ssh-keygen -t ed25519                    # 一路回车
+ssh-copy-id my@192.168.0.168             # 输最后一次密码
+ssh my@192.168.0.168                     # 之后就不用密码了
+```
+
+嫌 IP 难记，在 Termux 的 `~/.ssh/config` 里写一段：
+
+```
+Host home
+    HostName 192.168.0.168
+    User my
+```
+
+于是 `ssh home` 就够了。
+
+### 4.4 断线不丢工作：tmux
+
+手机网络说断就断，直接敲命令断一次就白干。长任务一律放进 tmux 会话：
+
+```sh
+ssh home
+tmux new -s build        # 开一个叫 build 的会话
+make cuda                # 在会话里跑
+# —— 断线了 —— 重连后：
+tmux attach -t build     # 回去了，make 还在跑
+```
+
+常用的就三个：`tmux ls` 列会话、`Ctrl-b d` 脱离（断开但保留）、`tmux attach -t 名字` 回来。
+
+### 4.5 移动网络用 mosh 更稳
+
+```sh
+mosh home
+```
+
+mosh 走 UDP（默认 60000–61000），台式机防火墙要放行这段端口。
+它的好处是切网络、休眠唤醒后不用重连，敲字还有本地回显，延迟高时手感好很多。
+
+### 4.6 不在同一个局域网时
+
+* **同一个 WiFi**：直接用上面的局域网 IP。
+* **在外面**：需要内网穿透或 VPN。图省事可以用 Tailscale（两台机器装好、登录同一账号，
+  各自拿到一个固定内网 IP）——具体安装方式看它官网，别照抄来路不明的脚本。
+  自建就是 WireGuard 或 frp。**把 SSH 直接暴露到公网不建议**。
+* **台式机睡着了**：BIOS 里开 Wake-on-LAN，手机发个 magic packet 把它叫醒。
+
+### 4.7 Termux 自身的小坑
+
+* 熄屏后进程被杀：系统设置里把 Termux 加进电池优化白名单；跑长任务时先 `termux-wake-lock`
+* 要访问手机上的文件：`termux-setup-storage`
+* 输入体验：外接蓝牙键盘，或装带 Ctrl/方向键的输入法（如 Hacker's Keyboard）
+
+> **这一段我无法验证**——手上没有 Android 设备。SSH/mosh/tmux 的用法是通用的，
+> 但 Termux 自身的坑（4.7）来自它的常见行为。遇到具体报错把错误信息发出来。
 
 ## 5. 用 CodeBuddy 开发这个项目
 
@@ -154,6 +229,8 @@ CodeBuddy 是 AI 编码工具（就是现在在跟你说话的这个）。本项
 - [ ] `make cpu` 或 `make cuda` 没有 `error`
 - [ ] `./ds4 --help` 打印出用法
 - [ ] 有 GPU：`./tests/test_cuda_ssd_cache` 全 PASS（约 5 秒）
+- [ ] 移动办公：从 Termux `ssh home` 能登上台式机，且不用输密码
+- [ ] 移动办公：`tmux new -s x` → 断网重连 → `tmux attach -t x` 还在
 - [ ] 有 GPU + 模型：能生成一段文本，并且 `--temp 0` 两次运行输出一致
 - [ ] 改过 `ds4_cuda.cu` 的话：测试是**重新编过**的，不是旧的
 
@@ -169,6 +246,11 @@ CodeBuddy 是 AI 编码工具（就是现在在跟你说话的这个）。本项
 | 显存不够 | 调小 `--ssd-streaming-cache-experts`（槽位数）或 `-c` |
 | 长 prompt 报 `ffn batch encode failed` | 槽位不够长 prompt 的"每层唯一专家"占用，退回 512 槽 |
 | 本机脚本里 `env VAR=x cmd` 静默失效 | 这台机器 PATH 里的 `env` 不转发参数，用 shell 前缀赋值 |
+| `ssh: connect to host ... port 22: Connection refused` | 台式机 sshd 没跑：`sudo systemctl enable --now ssh` |
+| `Permission denied (publickey)` | 公钥没拷上：在 Termux 跑 `ssh-copy-id 用户@IP`；台式机 `~/.ssh/authorized_keys` 权限应为 600 |
+| 昨天能连今天连不上 | DHCP 换 IP 了，去路由器把 MAC 和 IP 绑死 |
+| `mosh` 连不上 | 台式机防火墙要放行 UDP 60000–61000 |
+| Termux 熄屏就断 | 系统电池优化白名单 + `termux-wake-lock` |
 
 ## 8. 下一步读什么
 
