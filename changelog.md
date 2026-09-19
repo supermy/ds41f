@@ -34,6 +34,12 @@ Termux / Mac）、逐步命令、CodeBuddy 用法、成功检查清单、排错�
 **Termux 自身那段仍未验证**：手上没有 Android 设备。SSH/mosh/tmux 的用法是通用的，
 但"熄屏被杀、电池优化白名单、termux-wake-lock"这类来自它的常见行为，文档里已标注。
 
+**CodeBuddy 是实际写代码的那个**：教程的定位已按真实工作流写——Termux 登录 → 台式机上跑
+CodeBuddy → 它改代码、跑构建和测试 → 人下需求、批方案、验收。第 5 节新增
+"在 tmux 会话里跑 CodeBuddy"（它改代码+构建+测试要几分钟到几十分钟，不需要保持连接，
+挂回 `tmux attach` 就行），并把验收标准写死：看 `git diff`、测试、实测 t/s 与落盘字节，
+以及 `--temp 0` 正文 md5 是否与改动前**逐字一致**——"更快但输出变了"是 bug 不是收益。
+
 **改动位置**：`ds4.c`、`docs/DEV_ENV_SETUP.md`（新）、`README.md`、`README_CN.md`、`changelog.md`。
 
 ---
