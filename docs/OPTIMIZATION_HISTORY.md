@@ -7,6 +7,8 @@ NVMe（Fanxiang S910Pro 2TB，`/data` 为 ext4 on nvme1n1p6）、CUDA 13.3。
 
 文档索引
 
+- **相对 antirez 上游做了哪些优化、逐模型的实测幅度**：
+  [OPTIMIZATIONS_VS_UPSTREAM.md](OPTIMIZATIONS_VS_UPSTREAM.md)
 - 读透式主机专家缓存的方案与偏差：[PLAN-host-expert-cache.md](PLAN-host-expert-cache.md)（已实现）
 - 调优后的实用命令：仓库根目录 `优化步骤教程.md`、[中文 README](../README_CN.md) 的
   「SSD 流式调优」章节、[英文 README](../README.md) 的 "SSD streaming tuning" 章节

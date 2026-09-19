@@ -339,6 +339,7 @@ DGX Spark results, comparison conditions, and benchmark commands.
 - [Performance](docs/PERFORMANCE.md): reproducible measurements and recorded baselines.
 - [Testing and development](docs/TESTING.md): regression tests, debugging, and model-building tools.
 - [Optimization history and goals](docs/OPTIMIZATION_HISTORY.md): every CUDA SSD-streaming pass, its measured result, and what was rejected. The read-through host expert cache it describes has since landed; [its design notes](docs/PLAN-host-expert-cache.md) are kept as an implementation record.
+- [Optimizations over upstream](docs/OPTIMIZATIONS_VS_UPSTREAM.md): what this fork changed for CUDA SSD streaming, and the measured gain per model (V4 Flash 4.09x, V4.1 Flash 3.54x, GLM 5.3 Flash 4.59x).
 
 Local tuning notes, in Chinese: root-level `优化步骤教程.md`
 (build → baseline → concurrency sweep → debugging hangs → regression).

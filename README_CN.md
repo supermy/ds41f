@@ -340,6 +340,9 @@ turn 标记必须位于行首，角色必须交替，最后一轮必须是 `ASSI
 - [优化记录与目标](docs/OPTIMIZATION_HISTORY.md)：CUDA SSD 流式路径上每一次优化的
   目标、做法、实测结果与被否决的方案；其中读透式主机专家缓存的设计笔记保留在
   [PLAN-host-expert-cache.md](docs/PLAN-host-expert-cache.md)（已实现，作为实现记录）。
+- [相对上游做了哪些优化](docs/OPTIMIZATIONS_VS_UPSTREAM.md)：本 fork 相对 antirez/ds4
+  在 CUDA SSD 流式上的全部改动，以及逐模型的实测幅度
+  （V4 Flash 4.09×、V4.1 Flash 3.54×、GLM 5.3 Flash 4.59×）。
 
 提交 PR 之前请先读 [CONTRIBUTING.md](CONTRIBUTING.md)。
 

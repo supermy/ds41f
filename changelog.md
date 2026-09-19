@@ -1,5 +1,31 @@
 # Changelog
 
+## 2026-09-19 — 新增《相对上游做了哪些优化》，并把三模型的基线→最优链条测完整
+
+**改动**：新增 `docs/OPTIMIZATIONS_VS_UPSTREAM.md`，汇总本 fork 相对 antirez/ds4 的全部优化
+（目标 / 做法 / 影响哪个模型 / 幅度），并给出 V4 Flash、V4.1 Flash、GLM 5.3 Flash
+三个模型从"上游基线"到"本机最优"的逐步链条与复现命令。`README.md`、`README_CN.md`
+详细指南与 `docs/OPTIMIZATION_HISTORY.md` 文档索引各加一条链接。
+
+**实测**（96 GB 级内存，RTX 5060 Ti 16 GiB，同一 prompt，`--temp 0 -n 128`）
+
+基线是同一份二进制关掉三个开关后的读数，不是编译上游代码测的：
+`DS4_CUDA_DISABLE_EXPERT_PARALLEL_READ=1 DS4_RAM_RESIDENT_EXPERTS=0 DS4_HOST_EXPERT_CACHE=off`。
+
+| 模型 | 上游基线 | +并行预取 | +常驻池/读透缓存 | +调优 | **总计** |
+|---|---|---|---|---|---|
+| V4 Flash IQ2XXS | 3.71 | 7.14 | 13.46 | **15.16**（960 槽） | **4.09×** |
+| V4.1 Flash Q2 | 1.78 | 3.85 | **6.31**（读透缓存） | — | **3.54×** |
+| GLM 5.3 Flash Q2 | 1.57 | 3.82 | 6.07 | **7.20**（压预留全常驻） | **4.59×** |
+
+prefill 同口径：V4 2.34 → 6.47（2.77×）、V4.1 2.60 → 5.77（2.22×）、GLM 2.64 → 7.51（2.84×）。
+落盘字节：V4 132 → 79 GiB、V4.1 317 → 89 GiB（−72%）、GLM 310 → 89 GiB（−71%）。
+
+**改动位置**：`docs/OPTIMIZATIONS_VS_UPSTREAM.md`（新）、`README.md`、`README_CN.md`、
+`docs/OPTIMIZATION_HISTORY.md`、`changelog.md`。本次无代码改动。
+
+---
+
 ## 2026-09-19 — `DS4_RAM_RESIDENT_RESERVE_MB`：让差几个 GiB 的 checkpoint 也能全量常驻
 
 **动机**：主机预留固定为总内存的 1/8（本机 11.68 GiB），于是 GLM 5.3 Flash 的
