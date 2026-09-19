@@ -203,18 +203,24 @@ make tests/test_cuda_ssd_cache  # 关键：make cuda 不会重建测试
 
 改过 `ds4_cuda.cu` 却忘了重建测试，就会拿着旧二进制的挂死现象去做错误归因。
 
-#### 2. 推荐命令（16 GiB 显卡 + 约 90 GB 内存的机器）
+#### 2. 推荐命令（16 GiB 显卡 + 96 GB 内存的机器）
 
 ```sh
-# DeepSeek V4 Flash IQ2XXS：路由专家装得进内存，会走 pin 一次性预载的路径
+# DeepSeek V4 Flash IQ2XXS：路由专家装得进内存，整包 pin 进主机内存（15.16 t/s）
 ./ds4 --cuda -m ds4flash-iq2xxs.gguf --ssd-streaming \
-      --ssd-streaming-cache-experts 512 -c 4096 --prefill-chunk 512 \
-      --nothink --temp 0 -n 96
+      --ssd-streaming-cache-experts 960 -c 2048 --prefill-chunk 512 \
+      --nothink --temp 0 -n 128 -p "<prompt>"
 
-# DeepSeek V4.1 Flash Q2：专家装不进内存，走分层预取的磁盘路径
+# DeepSeek V4.1 Flash Q2：装不进内存，走读透式主机缓存（41 是槽位数，6.31 t/s）
 ./ds4 --cuda -m DeepSeek-V4.1-Flash-Q2.gguf --ssd-streaming \
       --ssd-streaming-cache-experts 41 -c 2048 --prefill-chunk 512 \
-      --nothink --temp 0 -n 64
+      --nothink --temp 0 -n 128 -p "<prompt>"
+
+# GLM 5.3 Flash Q2：默认预留下差约 3 GiB，压低预留就能全常驻（7.20 t/s）
+# 16 GiB 卡必须加 DS4_GLM_MEMORY_GUARD=0，且 GLM 不接受 --prefill-chunk
+DS4_GLM_MEMORY_GUARD=0 DS4_RAM_RESIDENT_RESERVE_MB=6144 ./ds4 --cuda \
+      -m GLM-5.3-Flash-Q2.gguf --ssd-streaming -c 2048 \
+      --nothink --temp 0 -n 128 -p "<prompt>"
 ```
 
 #### 3. 开关与环境变量
@@ -235,17 +241,40 @@ make tests/test_cuda_ssd_cache  # 关键：make cuda 不会重建测试
 （要么打出已 pin 的层数与 GiB，要么说明为什么跳过），
 以及 `ds4: expert cache: N slots x X MiB = Y GiB VRAM`。
 
-#### 4. 实测（RTX 5060 Ti 16 GiB，93 GB 内存，同一 prompt，`--temp 0`）
+#### 4. 实测（RTX 5060 Ti 16 GiB，96 GB 内存，同一 prompt，`--temp 0 -n 128`）
 
-| 模型 | 配置 | 解码 t/s |
-| --- | --- | --- |
-| V4 Flash IQ2XXS | 专家内存池关闭 | 7.22 |
-| V4 Flash IQ2XXS | 专家内存池自动启用 | **13.02** |
-| V4.1 Flash Q2 | 串行读专家 | 1.93 |
-| V4.1 Flash Q2 | 并行读专家（默认） | 3.80 |
-| V4.1 Flash Q2 | 并行读专家 + 读透式主机缓存（默认 26 GiB） | **6.30** |
+**基线**＝上游行为，用同一份二进制关掉三项新增来近似：
+`DS4_CUDA_DISABLE_EXPERT_PARALLEL_READ=1 DS4_RAM_RESIDENT_EXPERTS=0 DS4_HOST_EXPERT_CACHE=off`。
 
-一次性预载 72.56 GiB 用 10.0 s（7.7 GB/s），已达本机裸盘 O_DIRECT 顺序读约 90%。
+| 模型 | 基线 | +并行预取 | +读透缓存 | +全常驻 | 总幅度 |
+| --- | --- | --- | --- | --- | --- |
+| V4 Flash IQ2XXS | 3.71 | 7.14 | — | **15.16** | **4.09×** |
+| V4.1 Flash Q2 | 1.78 | 3.85 | **6.31** | — | **3.54×** |
+| GLM 5.3 Flash Q2 | 1.57 | 3.82 | 6.07 | **7.20** | **4.59×** |
+
+后两列**互斥**：checkpoint 要么装得进内存（整包 pin，读透缓存根本不会建），
+要么装不进（那就只剩读透缓存）。所以空格不是漏测：
+
+- **V4 Flash**（72.56 GiB 专家，装得下）：3.71 → 7.14（预取）→ 13.46（池，稳妥的 512 槽）
+  → **15.16**（960 槽，这张卡的极限；1200 会分配失败）。落盘 132 → 79 GiB。
+- **V4.1 Flash Q2**（142.38 GiB，装不下）：1.78 → 3.85 → **6.31**。
+  读透缓存把落盘从 317 削到 89 GiB（命中率 73.7%），全部收益都来自这里。
+- **GLM 5.3 Flash Q2**（默认预留下差 2.6 GiB）：拿到读透缓存 6.07；
+  用 `DS4_RAM_RESIDENT_RESERVE_MB=6144` 把 81.63 GiB pin 下来 → **7.20**（prefill 7.51）。
+  落盘 310 → 89 GiB。
+
+prefill 同向变化：2.34 → 6.47、2.60 → 5.77、2.64 → 7.51 t/s。
+
+两个值得从数字里读出来的结论：
+
+- **并行预取搬的字节一个没少**（GLM 上 310 GiB，和基线完全相同），速度却 2.43×。
+  盘本来就在供这些字节，丢掉的是等待——**墙是队列深度，不是带宽**。
+- **全常驻不等于能碰到带宽天花板**：V4 Flash 到 PCIe 上限的 97%（15.16 / 15.6），
+  GLM 只有 65%（7.20 / 11.0）——46 层里有 3 层不进池，且它走 full-attention 而非压缩 KV，
+  剩下的瓶颈是 attention 而不是字节。
+
+一次性预载 72.56 GiB 用 10.0 s（7.7 GB/s），已达本机裸盘 O_DIRECT 顺序读约 90%；
+GLM 全常驻预载 81.63 GiB 用 11.8 s（7.5 GB/s）。
 
 **读透缓存的预算扫描**（Q2，同一 prompt，`--temp 0 -n 128`）：
 
@@ -275,6 +304,13 @@ make tests/test_cuda_ssd_cache  # 关键：make cuda 不会重建测试
   只有短 prompt 压测才能推到 960（约 9.2 t/s 上限）。
 - `--host-offload-token-embd` 释放出来的 1.2 GiB **不会变成更多专家槽**：
   规划器按显存总量估算槽位，真正的收益是上下文/prefill/OOM 余量。
+- **GLM 在小显存卡上必须加 `DS4_GLM_MEMORY_GUARD=0`**：它的内存守卫要预留 32 GiB，
+  16 GiB 卡上预算直接算成 0，直接拒绝启动。
+- **GLM 不接受 `--prefill-chunk`**（"GLM uses graph-selected prefill chunks"），
+  且 `-c` 大小不影响解码速度（512 与 2048 实测相同）。
+- **压预留换全常驻是有代价的**：pin 掉 GLM 的 81.63 GiB 后系统只剩约 9 GiB。
+  `ds4` 把自己的 `oom_score_adj` 设成 1000，真 OOM 时先杀它，
+  但内存另有用途的机器别这么干。
 - `ds4-bench` 的预算算法和 `ds4` 不一样，同样的 `NGB` 会塌成 1 个槽，
   且要求 prompt 不少于 `--ctx-start`；做解码对比建议直接用 `ds4` 一次性生成。
 - `ds4` 有单实例锁，残留进程会让后续运行直接报 "already running"：

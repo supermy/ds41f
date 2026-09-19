@@ -218,18 +218,24 @@ make tests/test_cuda_ssd_cache
 ./tests/test_cuda_ssd_cache     # ~5 s; hangs (rather than fails) if the prefetch pool breaks
 ```
 
-Recommended invocations on a 16 GiB card with ~90 GB of RAM:
+Recommended invocations on a 16 GiB card with 96 GB of RAM:
 
 ```sh
-# DeepSeek V4 Flash IQ2XXS — routed experts fit in RAM, so the pin-and-copy path engages
+# DeepSeek V4 Flash IQ2XXS — the routed experts fit, so the whole set is pinned at startup
 ./ds4 --cuda -m ds4flash-iq2xxs.gguf --ssd-streaming \
-      --ssd-streaming-cache-experts 512 -c 4096 --prefill-chunk 512 \
-      --nothink --temp 0 -n 96
+      --ssd-streaming-cache-experts 960 -c 2048 --prefill-chunk 512 \
+      --nothink --temp 0 -n 128 -p "<prompt>"
 
-# DeepSeek V4.1 Flash Q2 — experts do not fit in RAM; falls back to staged reads
+# DeepSeek V4.1 Flash Q2 — experts do not fit; the read-through host cache engages (41 = slots)
 ./ds4 --cuda -m DeepSeek-V4.1-Flash-Q2.gguf --ssd-streaming \
       --ssd-streaming-cache-experts 41 -c 2048 --prefill-chunk 512 \
-      --nothink --temp 0 -n 64
+      --nothink --temp 0 -n 128 -p "<prompt>"
+
+# GLM 5.3 Flash Q2 — misses fitting by ~3 GiB under the default reserve; a smaller
+# reserve makes it fit, and DS4_GLM_MEMORY_GUARD is required on a 16 GiB card
+DS4_GLM_MEMORY_GUARD=0 DS4_RAM_RESIDENT_RESERVE_MB=6144 ./ds4 --cuda \
+      -m GLM-5.3-Flash-Q2.gguf --ssd-streaming -c 2048 \
+      --nothink --temp 0 -n 128 -p "<prompt>"
 ```
 
 Flags that matter, and when to reach for them:
@@ -249,22 +255,49 @@ Startup tells you which path you got — look for `ds4: RAM-resident experts: ..
 (either the pinned summary or the reason it was skipped) and
 `ds4: expert cache: N slots x X MiB = Y GiB VRAM`.
 
-Measured on an RTX 5060 Ti 16 GiB with 93 GB of RAM, same prompt, `--temp 0`:
+Measured on an RTX 5060 Ti 16 GiB with 96 GB of RAM, same prompt, `--temp 0 -n 128`.
+**Baseline** is what upstream does, approximated by switching all three additions off
+in the same binary:
+`DS4_CUDA_DISABLE_EXPERT_PARALLEL_READ=1 DS4_RAM_RESIDENT_EXPERTS=0 DS4_HOST_EXPERT_CACHE=off`.
 
-| Model | Configuration | Decode t/s |
-| --- | --- | --- |
-| V4 Flash IQ2XXS | expert pool disabled | 7.22 |
-| V4 Flash IQ2XXS | expert pool auto-enabled | **13.02** |
-| V4.1 Flash Q2 | serial expert reads | 1.93 |
-| V4.1 Flash Q2 | parallel reads (default) | 3.80 |
-| V4.1 Flash Q2 | + read-through host cache (default 26 GiB) | **6.30** |
+| Model | Baseline | + parallel prefetch | + read-through cache | + full residency | Total |
+| --- | --- | --- | --- | --- | --- |
+| V4 Flash IQ2XXS | 3.71 | 7.14 | — | **15.16** | **4.09×** |
+| V4.1 Flash Q2 | 1.78 | 3.85 | **6.31** | — | **3.54×** |
+| GLM 5.3 Flash Q2 | 1.57 | 3.82 | 6.07 | **7.20** | **4.59×** |
 
-On Q2 the read-through cache cuts the bytes that reach the drive from 316 GiB to 89 GiB
-over a 128-token run (73.7% hit rate), which is where the whole gain comes from.
-The budget sweep flattens quickly — 8 GiB / 16 GiB / 32 GiB / 78 GiB measured
-5.23 / 6.23 / 6.30 / 6.17 t/s — so the default takes a third of the usable host memory
-rather than all of it; the extra pinned memory buys almost no hits and only starves the
-page cache. Pass `DS4_HOST_EXPERT_CACHE=48` (GiB) if you measured otherwise on your box.
+The last two columns are mutually exclusive by design: a checkpoint either fits in host
+memory — then it is pinned whole and the read-through cache is never built — or it does
+not, and then the cache is all that is left. Hence the empty cells:
+
+* **V4 Flash** fits (72.56 GiB of experts): 3.71 → 7.14 (prefetch) → 13.46 (pool with
+  the safe 512 slots) → **15.16** with 960 slots, which is this card's limit (1200 fails
+  to allocate). Traffic to the drive: 132 → 79 GiB.
+* **V4.1 Flash Q2** does not fit (142.38 GiB): 1.78 → 3.85 → **6.31**. The cache cuts
+  drive traffic from 317 to 89 GiB at a 73.7% hit rate; that is the entire gain.
+* **GLM 5.3 Flash Q2** misses fitting by 2.6 GiB under the default reserve, so it gets
+  the cache (6.07), but `DS4_RAM_RESIDENT_RESERVE_MB=6144` lets the 81.63 GiB pin anyway
+  for **7.20** (prefill 7.51). Traffic 310 → 89 GiB.
+
+Prefill moves the same way: 2.34 → 6.47, 2.60 → 5.77, 2.64 → 7.51 t/s.
+
+Two things worth reading off those numbers:
+
+* **Parallel prefetch moves exactly the same bytes** — 310 GiB on GLM, unchanged from
+  baseline — yet runs 2.43× faster. The drive was already supplying those bytes; what
+  was being lost was waiting, so the wall was queue depth, not bandwidth.
+* **Full residency does not mean you reach the bandwidth ceiling.** V4 Flash gets to
+  97% of what PCIe allows (15.16 of a 15.6 t/s ceiling). GLM gets to 65% (7.20 of 11.0):
+  three of its 46 layers never enter the pool, and it runs a full-attention path rather
+  than a compressed-KV one. Its remaining bottleneck is attention, not bytes.
+
+The read-through budget flattens quickly — 8 / 16 / 32 / 78 GiB measured
+5.23 / 6.23 / 6.30 / 6.17 t/s on Q2 — so the default takes a third of the usable host
+memory rather than all of it; the extra pinned memory buys almost no hits and only
+starves the page cache. Pass `DS4_HOST_EXPERT_CACHE=48` (GiB) to override.
+
+Per-model ladders, the reasoning behind each step and the reproduction commands:
+[Optimizations over upstream](docs/OPTIMIZATIONS_VS_UPSTREAM.md).
 
 Pitfalls worth knowing before you start tuning:
 
@@ -275,6 +308,13 @@ Pitfalls worth knowing before you start tuning:
 * The expert slots freed by `--host-offload-token-embd` do **not** become more expert
   slots — the planner sizes slots from total VRAM, so the real gain is context, prefill,
   and OOM headroom.
+* GLM refuses to start on a small card without `DS4_GLM_MEMORY_GUARD=0`: its memory
+  guard reserves 32 GiB, which leaves a 16 GiB card with a budget of zero.
+* GLM rejects `--prefill-chunk` ("GLM uses graph-selected prefill chunks"), and its
+  `-c` size does not affect decode speed (512 and 2048 measured the same).
+* Spending the host reserve on residency is a real trade: pinning GLM's 81.63 GiB leaves
+  the system about 9 GiB. `ds4` sets its own `oom_score_adj` to 1000, so it is killed
+  first, but do not do this on a machine that needs the memory.
 
 ### Output and power
 
