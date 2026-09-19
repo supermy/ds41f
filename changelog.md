@@ -1,5 +1,41 @@
 # Changelog
 
+## 2026-09-19 — 0.6：GitHub Actions 自动构建与发布
+
+**改动**：新增 `.github/workflows/release.yml`。tag（`v*`）推送即构建并发布 release；
+PR 只构建不发布；`workflow_dispatch` 可手动指定 CUDA 架构重新出包。
+
+| job | 环境 | 命令 | 产物 |
+|---|---|---|---|
+| `linux-cuda` | ubuntu-latest + CUDA toolkit 12.8 | `make cuda CUDA_ARCH=sm_120a` | 带本 fork 全部 CUDA SSD 流式优化 |
+| `linux-cpu` | ubuntu-latest | `make cpu`（`DS4_NO_GPU`） | 无 GPU 依赖的通用版 |
+| `windows-cpu` | windows-latest + MSYS2/MinGW-w64 | `make cpu` | **实验性，允许失败**（见下） |
+
+发布产物统一用 `-march=x86-64-v2 -mtune=generic` 而不是默认的 `-march=native`：
+核心代码不直接用 SIMD intrinsics（靠编译器自动向量化），降档后仍然正确，
+但要保证编译出来的二进制能在别的机器上跑。CUDA job 用 `-j2`，nvcc 编这几个大文件
+单个就要几 GB，runner 只有 16 GB。
+
+**Windows 构建状态：实验性，这一版很可能没有 `windows` 产物**
+
+`Makefile` 只认 Darwin 与 Linux，源码没有 Windows 分支，缺一个 POSIX 兼容层。
+这个 job 设了 `continue-on-error`，让 CI 持续暴露真实的编译错误，作为后续移植的输入：
+
+| 需要的 | 用在哪 | 说明 |
+|---|---|---|
+| `sys/mman.h`（`mmap`/`munmap`/`madvise`） | `ds4.c` 模型加载：mmap 1 处、munmap 3 处、madvise 1 处 | 用 `CreateFileMapping`/`MapViewOfFile` 封装，`madvise` 可 no-op |
+| `flock` | `ds4.c` 单实例锁，1 处 | 换 `LockFileEx`，或改成 `O_EXCL` 建锁文件 |
+| `sys/socket.h`、`netinet/in.h`、`netinet/tcp.h`、`poll.h`、`arpa/inet.h`、`sys/wait.h` | `ds4_distributed.c`、`ds4_tp.c`、`ds4_web.c`、`ds4_server.c` | Winsock2 适配：`close()→closesocket()`、`errno→WSAGetLastError()`，还要 `WSAStartup` |
+| `O_DIRECT` | SSD 直读路径 | 换 `FILE_FLAG_NO_BUFFERING`，或退化到 buffered |
+| `pthread`（约 262 处） | 各模块 | MinGW 的 winpthreads 可直接用 |
+| `pread`（约 15 处） | `ds4.c` 等 | mingw-w64 提供 |
+
+**改动位置**：`.github/workflows/release.yml`（新）、`changelog.md`。本次无推理代码改动。
+
+**发布**：`v0.6`。
+
+---
+
 ## 2026-09-19 — 新增《相对上游做了哪些优化》，并把三模型的基线→最优链条测完整
 
 **改动**：新增 `docs/OPTIMIZATIONS_VS_UPSTREAM.md`，汇总本 fork 相对 antirez/ds4 的全部优化
