@@ -203,27 +203,59 @@ make tests/test_cuda_ssd_cache  # 关键：make cuda 不会重建测试
 
 改过 `ds4_cuda.cu` 却忘了重建测试，就会拿着旧二进制的挂死现象去做错误归因。
 
-#### 2. 推荐命令（16 GiB 显卡 + 96 GB 内存的机器）
+#### 2. 最优命令与参数（每个模型实测最快的那一组）
 
 ```sh
-# DeepSeek V4 Flash IQ2XXS：路由专家装得进内存，整包 pin 进主机内存（15.16 t/s）
+# ── V4 Flash IQ2XXS：15.16 t/s
+#    专家 72.56 GiB 装得下 → 启动时整包 pin。960 槽是这张卡的极限（1200 会分配失败）；
+#    长 prompt 要退回 512 槽 + -c 4096。
 ./ds4 --cuda -m ds4flash-iq2xxs.gguf --ssd-streaming \
       --ssd-streaming-cache-experts 960 -c 2048 --prefill-chunk 512 \
       --nothink --temp 0 -n 128 -p "<prompt>"
 
-# DeepSeek V4.1 Flash Q2：装不进内存，走读透式主机缓存（41 是槽位数，6.31 t/s）
+# ── V4.1 Flash Q2：6.31 t/s
+#    专家 142.38 GiB 装不下 → 靠读透式主机缓存。41 是槽位数不是字节预算，
+#    写 NGB 会塌成 1 个槽。
 ./ds4 --cuda -m DeepSeek-V4.1-Flash-Q2.gguf --ssd-streaming \
       --ssd-streaming-cache-experts 41 -c 2048 --prefill-chunk 512 \
       --nothink --temp 0 -n 128 -p "<prompt>"
 
-# GLM 5.3 Flash Q2：默认预留下差约 3 GiB，压低预留就能全常驻（7.20 t/s）
-# 16 GiB 卡必须加 DS4_GLM_MEMORY_GUARD=0，且 GLM 不接受 --prefill-chunk
+# ── GLM 5.3 Flash Q2：7.20 t/s
+#    默认预留下差约 3 GiB，压到 6 GiB 就能把 81.63 GiB pin 下来。两个 env 都必须给：
+#    不给守卫，16 GiB 卡上直接拒绝启动。GLM 不接受 --prefill-chunk，所以这里没有它。
 DS4_GLM_MEMORY_GUARD=0 DS4_RAM_RESIDENT_RESERVE_MB=6144 ./ds4 --cuda \
       -m GLM-5.3-Flash-Q2.gguf --ssd-streaming -c 2048 \
       --nothink --temp 0 -n 128 -p "<prompt>"
 ```
 
-#### 3. 开关与环境变量
+量"这些优化值多少"时用基线对照——同一份二进制关掉三项新增即可，不用重新编译：
+
+```sh
+DS4_CUDA_DISABLE_EXPERT_PARALLEL_READ=1 DS4_RAM_RESIDENT_EXPERTS=0 \
+DS4_HOST_EXPERT_CACHE=off ./ds4 --cuda -m <模型> ...   # V4 3.71 · V4.1 1.78 · GLM 1.57
+```
+
+本节所有数字都来自同一套口径：固定一个 prompt（"Explain what mmap is, briefly."）、
+`--nothink --temp 0 -n 128`，并且**把生成的正文做 md5 校验，各配置必须逐字一致**——
+一个"更快"但改了输出的配置是 bug，不是收益。
+
+#### 3. 测试环境（本文档所有数字的来源）
+
+| | |
+| --- | --- |
+| GPU | NVIDIA RTX 5060 Ti 16 GiB（可用 15.48 GiB，sm_120） |
+| 主机内存 | 96 GB —— `MemTotal` 97959540 kB ≈ 93.4 GiB，`MemAvailable` 约 90 GiB |
+| 模型所在盘 | Fanxiang S910Pro 2TB NVMe，`/data` 为 ext4（`/dev/nvme1n1p6`） |
+| 盘速 | 裸盘 O_DIRECT 顺序读 8.7 GB/s；重叠读约 13 GB/s |
+| 系统 / 内核 | Ubuntu 24.04.2 LTS，Linux 6.8.0-139-generic |
+| CUDA / 编译器 | CUDA 13.3，gcc 13.3.0，`make cuda` |
+| checkpoint | V4 Flash IQ2XXS 80.76 GiB · V4.1 Flash Q2 340.60 GiB · GLM 5.3 Flash Q2 89.88 GiB |
+
+这台机器有三个特性决定了后面所有数字：显存只有 16 GiB（专家槽稀缺）、
+可用主机内存约 90 GiB（72 GiB 的专家装得下，142 GiB 的装不下）、
+一块约 8.7 GB/s 的 NVMe。换机器时按这三条重新推算，别直接抄数值。
+
+#### 4. 开关与环境变量
 
 | 开关 / 环境变量 | 默认值 | 什么时候用 |
 | --- | --- | --- |
@@ -241,7 +273,7 @@ DS4_GLM_MEMORY_GUARD=0 DS4_RAM_RESIDENT_RESERVE_MB=6144 ./ds4 --cuda \
 （要么打出已 pin 的层数与 GiB，要么说明为什么跳过），
 以及 `ds4: expert cache: N slots x X MiB = Y GiB VRAM`。
 
-#### 4. 实测（RTX 5060 Ti 16 GiB，96 GB 内存，同一 prompt，`--temp 0 -n 128`）
+#### 5. 实测（同一 prompt，`--temp 0 -n 128`）
 
 **基线**＝上游行为，用同一份二进制关掉三项新增来近似：
 `DS4_CUDA_DISABLE_EXPERT_PARALLEL_READ=1 DS4_RAM_RESIDENT_EXPERTS=0 DS4_HOST_EXPERT_CACHE=off`。
@@ -296,7 +328,7 @@ GLM 全常驻预载 81.63 GiB 用 11.8 s（7.5 GB/s）。
 逼近盘带宽时该做的是**削字节**（更小 checkpoint / 批处理摊薄 / 换更快的介质），
 而不是继续加管道（更大的并发、更深的预取）。
 
-#### 5. 坑
+#### 6. 坑
 
 - `--temp 0` 是 A/B 对比的硬要求：默认采样不确定。
 - 长 prompt 会为"每层 × 每个唯一路由专家"占槽：IQ2XXS 上 799 token 的 prompt

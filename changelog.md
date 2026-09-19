@@ -1,5 +1,28 @@
 # Changelog
 
+## 2026-09-19 — README 补测试环境，并把推荐命令写成各模型的最优参数
+
+**改动**：`README.md` 与 `README_CN.md` 的调优章节。
+
+- **新增测试环境表**：GPU（RTX 5060 Ti 16 GiB，sm_120）、主机内存（96 GB，
+  `MemTotal` ≈ 93.4 GiB）、模型所在盘（Fanxiang S910Pro 2TB，`/data` ext4）、
+  盘速（裸盘 O_DIRECT 8.7 GB/s，重叠读约 13 GB/s）、系统内核（Ubuntu 24.04.2，6.8.0-139）、
+  CUDA 13.3 / gcc 13.3.0、三个 checkpoint 的体积。
+  并点明这台机器决定所有数字的三个特性——16 GiB 显存、约 90 GiB 可用主机内存、
+  单块 8.7 GB/s NVMe——**换机器时按这三条重新推算，不要直接抄数值**。
+- **"推荐命令"改成"最优命令与参数"**：每个模型给实测最快的那一组，并注明参数为什么这么设：
+  V4 Flash 的 960 槽是这张卡的极限（1200 分配失败，长 prompt 要退回 512 槽 + `-c 4096`）；
+  V4.1 的 `41` 是槽位数不是字节预算（写 `NGB` 会塌成 1 个槽）；
+  GLM 必须给 `DS4_GLM_MEMORY_GUARD=0` 且不接受 `--prefill-chunk`。
+- **补基线对照命令与测量口径**：基线是同一份二进制关掉三项新增（无需重新编译）；
+  口径是固定 prompt、`--nothink --temp 0 -n 128`、**正文 md5 各配置必须逐字一致**
+  （"更快"但改了输出的配置是 bug 不是收益）。
+- 中文版小节重排为：1 构建 / 2 最优命令与参数 / 3 测试环境 / 4 开关 / 5 实测 / 6 坑。
+
+**改动位置**：`README.md`、`README_CN.md`、`changelog.md`。无代码改动。
+
+---
+
 ## 2026-09-19 — README 实测部分补上 GLM 5.3 Flash，并换成四阶段优化表
 
 **改动**：`README.md` 与 `README_CN.md` 的「SSD 流式调优 / SSD streaming tuning」章节。

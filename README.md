@@ -218,25 +218,62 @@ make tests/test_cuda_ssd_cache
 ./tests/test_cuda_ssd_cache     # ~5 s; hangs (rather than fails) if the prefetch pool breaks
 ```
 
-Recommended invocations on a 16 GiB card with 96 GB of RAM:
+The environment those numbers come from:
+
+| | |
+| --- | --- |
+| GPU | NVIDIA RTX 5060 Ti 16 GiB (15.48 GiB usable, sm_120) |
+| Host memory | 96 GB — `MemTotal` 97959540 kB ≈ 93.4 GiB, `MemAvailable` ≈ 90 GiB |
+| Model storage | Fanxiang S910Pro 2 TB NVMe, `/data` on ext4 (`/dev/nvme1n1p6`) |
+| Drive speed | 8.7 GB/s raw O_DIRECT sequential read; ~13 GB/s to overlapping reads |
+| OS / kernel | Ubuntu 24.04.2 LTS, Linux 6.8.0-139-generic |
+| CUDA / compiler | CUDA 13.3, gcc 13.3.0, `make cuda` |
+| Checkpoints | V4 Flash IQ2XXS 80.76 GiB · V4.1 Flash Q2 340.60 GiB · GLM 5.3 Flash Q2 89.88 GiB |
+
+Three properties of this machine are what the tuning keys off, and all the
+numbers below follow from them: only 16 GiB of VRAM (expert slots are scarce),
+about 90 GiB of usable host memory (a 72 GiB expert set fits, a 142 GiB one
+cannot), and a single NVMe supplying ~8.7 GB/s.
+
+Fastest configuration per model, measured on that box:
 
 ```sh
-# DeepSeek V4 Flash IQ2XXS — the routed experts fit, so the whole set is pinned at startup
+# ── V4 Flash IQ2XXS — 15.16 t/s
+#    Experts (72.56 GiB) fit, so the whole routed set is pinned at startup.
+#    960 slots is this card's limit (1200 fails to allocate); a long prompt
+#    needs 512 slots with -c 4096 instead.
 ./ds4 --cuda -m ds4flash-iq2xxs.gguf --ssd-streaming \
       --ssd-streaming-cache-experts 960 -c 2048 --prefill-chunk 512 \
       --nothink --temp 0 -n 128 -p "<prompt>"
 
-# DeepSeek V4.1 Flash Q2 — experts do not fit; the read-through host cache engages (41 = slots)
+# ── V4.1 Flash Q2 — 6.31 t/s
+#    Experts (142.38 GiB) do not fit, so the read-through host cache carries it.
+#    41 is a slot count, not a byte budget — NGB would collapse it to one slot.
 ./ds4 --cuda -m DeepSeek-V4.1-Flash-Q2.gguf --ssd-streaming \
       --ssd-streaming-cache-experts 41 -c 2048 --prefill-chunk 512 \
       --nothink --temp 0 -n 128 -p "<prompt>"
 
-# GLM 5.3 Flash Q2 — misses fitting by ~3 GiB under the default reserve; a smaller
-# reserve makes it fit, and DS4_GLM_MEMORY_GUARD is required on a 16 GiB card
+# ── GLM 5.3 Flash Q2 — 7.20 t/s
+#    Misses fitting by ~3 GiB under the default reserve; a 6 GiB reserve lets
+#    the 81.63 GiB pin. Both env vars are needed: the guard otherwise refuses
+#    to start on a 16 GiB card. GLM rejects --prefill-chunk, so it is omitted.
 DS4_GLM_MEMORY_GUARD=0 DS4_RAM_RESIDENT_RESERVE_MB=6144 ./ds4 --cuda \
       -m GLM-5.3-Flash-Q2.gguf --ssd-streaming -c 2048 \
       --nothink --temp 0 -n 128 -p "<prompt>"
 ```
+
+To measure what any of this is worth, run the baseline: the same binary with the
+three additions switched off, no rebuild needed.
+
+```sh
+DS4_CUDA_DISABLE_EXPERT_PARALLEL_READ=1 DS4_RAM_RESIDENT_EXPERTS=0 \
+DS4_HOST_EXPERT_CACHE=off ./ds4 --cuda -m <model> ...   # V4 3.71 · V4.1 1.78 · GLM 1.57
+```
+
+Every number in this section comes from one protocol: a single prompt
+(`"Explain what mmap is, briefly."`), `--nothink --temp 0 -n 128`, and the
+generated text md5-checked to be byte-identical across configurations — a
+"faster" configuration that changes the output is a bug, not a gain.
 
 Flags that matter, and when to reach for them:
 
@@ -255,7 +292,7 @@ Startup tells you which path you got — look for `ds4: RAM-resident experts: ..
 (either the pinned summary or the reason it was skipped) and
 `ds4: expert cache: N slots x X MiB = Y GiB VRAM`.
 
-Measured on an RTX 5060 Ti 16 GiB with 96 GB of RAM, same prompt, `--temp 0 -n 128`.
+Measured on that box, same prompt, `--temp 0 -n 128`.
 **Baseline** is what upstream does, approximated by switching all three additions off
 in the same binary:
 `DS4_CUDA_DISABLE_EXPERT_PARALLEL_READ=1 DS4_RAM_RESIDENT_EXPERTS=0 DS4_HOST_EXPERT_CACHE=off`.
