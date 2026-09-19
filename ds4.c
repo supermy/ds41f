@@ -70246,10 +70246,24 @@ static void ds4_engine_install_expert_host_pool(ds4_engine *e) {
         host_avail = host_total;
     /* Scale the reserve with the machine instead of hardcoding a number: a
      * pinned pool cannot be swapped out, so the rest of the system needs a
-     * share proportional to what it has. */
+     * share proportional to what it has. DS4_RAM_RESIDENT_RESERVE_MB overrides
+     * it when a checkpoint lands a few GiB short of fitting -- GLM 5.3 needs
+     * 81.63 GiB of a 90.7 GiB MemAvailable, and what it cannot pin it must
+     * read from the drive every token. Spending part of the reserve on it is
+     * the user's call, not the default: what is left stays for the page cache
+     * and everything else running on the machine. */
     uint64_t reserve = host_total / 8u;
     if (reserve < 4u * gib) reserve = 4u * gib;
     if (reserve > 16u * gib) reserve = 16u * gib;
+    {
+        const char *renv = getenv("DS4_RAM_RESIDENT_RESERVE_MB");
+        if (renv && renv[0]) {
+            char *end = NULL;
+            const double mib = strtod(renv, &end);
+            if (end && end != renv && mib >= 0 && mib <= 65536)
+                reserve = (uint64_t)(mib * 1048576.0);
+        }
+    }
     uint64_t usable = host_avail > reserve ? host_avail - reserve : 0;
     if (e->ram_resident_experts_bytes != 0 && e->ram_resident_experts_bytes < usable)
         usable = e->ram_resident_experts_bytes;

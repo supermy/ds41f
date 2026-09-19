@@ -1,5 +1,41 @@
 # Changelog
 
+## 2026-09-19 — `DS4_RAM_RESIDENT_RESERVE_MB`：让差几个 GiB 的 checkpoint 也能全量常驻
+
+**动机**：主机预留固定为总内存的 1/8（本机 11.68 GiB），于是 GLM 5.3 Flash 的
+81.63 GiB 路由专家需要 93.31 GiB 可用，而本机 `MemAvailable` 只有约 90 GiB —— 差 2.6 GiB，
+只能走读透缓存。这个预留是为了系统上其他东西（pinned 内存不可换出），
+但"差一点点就装得下"时，这个取舍应该由用户决定。
+
+**改动**：新增 env `DS4_RAM_RESIDENT_RESERVE_MB`（MiB，0..65536），覆盖默认的
+`总内存/8`（夹在 4..16 GiB）。不设时行为与之前完全一致。
+它同时影响常驻池的判定和读透缓存的预算（两者共用 `usable`）。
+
+**改动位置**：`ds4.c`（`ds4_engine_install_expert_host_pool` 的预留计算）。
+
+**实测**（GLM 5.3 Flash Q2，同一 prompt，`--temp 0 -n 128`，16 GiB 卡 + 93 GiB 内存）
+
+| 配置 | 预留下 usable | 走的路径 | 解码 t/s | prefill t/s |
+|---|---|---|---|---|
+| 默认（11.68 GiB 预留） | 78.4 GiB < 81.63 | 读透缓存 | 6.06 | 5.67 |
+| `RESERVE_MB=6144` | 84.7 GiB | **全量常驻**（81.63 GiB pinned） | **7.20** | **7.82** |
+| `RESERVE_MB=8192` | 82.7 GiB | **全量常驻** | 7.20 | 7.76 |
+| 缓存全关 | — | 纯 SSD | 3.82 | 5.43 |
+
+预载 81.63 GiB 用 11.8 s（7.5 GB/s），43 of 46 层进池（3 层是混合精度层，不进 slab 缓存）。
+6 GiB 与 8 GiB 结果相同，说明 8 GiB 预留也够，按机器上还要跑什么在 6–8 之间选。
+代价是 pin 完系统只剩约 9 GiB；`ds4` 的 `oom_score_adj=1000` 保证 OOM 时先杀它。
+
+**上限的修正**：此前按 `2.61 GB ÷ 28.6 GB/s` 推算 GLM 全常驻能到 ~11 t/s，
+实测只有 7.20（139 ms/token）。差的那 48 ms 有据可查：3 个非均匀层仍走盘（约 17 ms），
+GLM 走 `full-attention argmax generation path` 而非压缩 KV 路径（约 30 ms）。
+即**搬字节不再是它的瓶颈，attention 计算才是**——同样全常驻，V4 Flash 能贴到 PCIe 的
+97%，GLM 只到 65%。
+
+**测试**：`tests/test_cuda_ssd_cache` 52 项全 PASS（本次改动只是一个 env 覆盖，默认路径不变）。
+
+---
+
 ## 2026-09-19 — 三个模型的横评、槽数扫描与上限核算（文档）
 
 **改动**：`docs/OPTIMIZATION_HISTORY.md` 新增第 9 节「三个模型的横评与上限」，

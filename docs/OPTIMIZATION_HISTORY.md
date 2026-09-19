@@ -32,6 +32,7 @@ NVMe（Fanxiang S910Pro 2TB，`/data` 为 ext4 on nvme1n1p6）、CUDA 13.3。
   （装上池之后再把专家槽推到 960，第 3 节与第 9 节）。
 - 装不进内存时的读透式主机缓存：V4.1 Q2 解码 3.85 → 6.30 t/s，GLM 5.3 Flash 3.82 → 6.06 t/s
   （第 4 节与第 9 节）。
+- 压低主机预留让 GLM 5.3 也全量常驻：6.06 → **7.20 t/s**（第 9 节）。
 
 **三条路径现在是同一个天花板**：V4 Flash 已贴住 PCIe（15.19 / 15.6 = 97%），
 V4.1 与 GLM 的有效带宽只有它的一半（数据要绕"盘→staging→H2D"两趟而不是一趟
@@ -63,6 +64,7 @@ pinned→device）。剩下能动的只有两件事：削字节（batch 解码 /
 | 2026-09-18 | 消灭整块落盘读 | `--ram-resident-experts`（全量常驻 pinned 池） | V4 Flash IQ2XXS：7.22 → **13.02** | 已实现 |
 | 2026-09-19 | 覆盖「装不进内存」的模型 | 读透式主机专家缓存 | V4.1 Q2：3.85 → **6.30**；GLM 5.3：3.82 → **6.06** | 已实现 |
 | 2026-09-19 | 把显存专家槽推到卡的极限 | 960 槽（1200+ 会 OOM） | V4 Flash IQ2XXS：13.55 → **15.19** | 已实现 |
+| 2026-09-19 | 让 GLM 也全量常驻 | `DS4_RAM_RESIDENT_RESERVE_MB` 压低预留 | GLM 5.3：6.06 → **7.20** | 已实现 |
 | 2026-09-18 | （评估）SSD→内存跨层预取 | 盘带宽 / 放大倍数核算 | 增益 ≈ 0（解码已在盘带宽上限） | 否决 |
 
 ## 1. 2026-09-17 — 路由专家预取并行化（V4.1 Flash Q2）
@@ -238,9 +240,9 @@ make tests/test_cuda_ssd_cache              # 改了 ds4_cuda.cu 必须单独重
 ./ds4 --cuda -m <Q2.gguf> --ssd-streaming --ssd-streaming-cache-experts 41 \
       -c 2048 --prefill-chunk 512 --nothink --temp 0 -n 128 -p "<prompt>"
 
-# GLM 5.3 Flash Q2：6.06 t/s（必须绕开守卫，且不能给 --prefill-chunk）
-DS4_GLM_MEMORY_GUARD=0 ./ds4 --cuda -m <GLM53-Q2.gguf> --ssd-streaming -c 2048 \
-      --nothink --temp 0 -n 128 -p "<prompt>"
+# GLM 5.3 Flash Q2：7.20 t/s（必须绕开守卫，且不能给 --prefill-chunk）
+DS4_GLM_MEMORY_GUARD=0 DS4_RAM_RESIDENT_RESERVE_MB=6144 ./ds4 --cuda -m <GLM53-Q2.gguf> \
+      --ssd-streaming -c 2048 --nothink --temp 0 -n 128 -p "<prompt>"
 
 # 三模型横评、槽数扫描与上限核算见第 9 节
 
@@ -284,7 +286,11 @@ DS4_CUDA_EXPERT_READ_DEPTH=8 ./ds4 --cuda ...
 |---|---|---|---|---|---|---|
 | V4 Flash IQ2XXS | 80.76 GiB | 72.56 GiB | 全量常驻池 | — | **15.19 t/s** | 1.83 GB |
 | V4.1 Flash Q2 | 340.60 GiB | 142.38 GiB | 读透缓存（装不下） | 3.85 | **6.30 t/s** | 2.65 GB |
-| GLM 5.3 Flash Q2 | 89.88 GiB | 81.63 GiB | 读透缓存（差 3.2 GiB） | 3.82 | **6.06 t/s** | 2.61 GB |
+| GLM 5.3 Flash Q2 | 89.88 GiB | 81.63 GiB | 读透缓存 → **全常驻**（见下） | 3.82 | **7.20 t/s** | 2.61 GB |
+
+GLM 的两档都实测过：默认预留下它差 2.6 GiB 装不下，走读透缓存是 6.06 t/s；
+把预留压到 6 GiB（`DS4_RAM_RESIDENT_RESERVE_MB=6144`）后 81.63 GiB 全量 pin 进主机内存，
+7.20 t/s，prefill 也从 5.67 提到 7.82 t/s。
 
 **V4 Flash 的专家槽扫描**（常驻池已装下全部 72.56 GiB，盘已出局）
 
@@ -303,8 +309,8 @@ DS4_CUDA_EXPERT_READ_DEPTH=8 ./ds4 --cuda ...
 | 模型 | 每 token | 实测 | 有效带宽 | 全常驻时的 PCIe 天花板 |
 |---|---|---|---|---|
 | V4 Flash | 1.83 GB | 15.19 t/s | **27.8 GB/s** | 15.6 t/s（已达 97%） |
-| V4.1 Flash | 2.65 GB | 6.30 t/s | 15.8 GB/s | 10.8 t/s |
-| GLM 5.3 Flash | 2.61 GB | 6.06 t/s | 15.8 GB/s | 11.0 t/s |
+| V4.1 Flash | 2.65 GB | 6.30 t/s（读透） | 15.8 GB/s | 10.8 t/s |
+| GLM 5.3 Flash | 2.61 GB | 6.06（读透）/ **7.20（全常驻）** t/s | 15.8 / 18.8 GB/s | 11.0 t/s（**实测只到 7.20**，见下） |
 
 - **V4 Flash 已贴死 PCIe**：`1.83 GB ÷ 28.6 GB/s = 64 ms` → 15.6 t/s，实测 15.19 是它的 97%。
   再快只能削字节（batch 解码）或加卡做 TP。
@@ -313,15 +319,42 @@ DS4_CUDA_EXPERT_READ_DEPTH=8 ./ds4 --cuda ...
   未命中 pread→staging→H2D，命中 pinned→H2D，两条路串行叠加，有效带宽只有 PCIe 的一半。
 - 所以差距不在模型，在内存：V4.1/GLM 每 token 字节只比 V4 Flash 多 45%，速度却只有 40%。
 
-**加内存能换到什么**（reserve 上限 16 GiB）
+**GLM 全常驻实测 7.20 t/s，比 PCIe 天花板 11.0 低 3.8 t/s —— 之前"加内存就能到 11"的预测偏乐观**
 
-| 模型 | 全常驻所需可用内存 | 需要多大的机器 | 预计速度 |
+`2.61 GB ÷ 28.6 GB/s = 91 ms` 只算了搬字节，实测是 139 ms/token，多出来的 48 ms 有据可查：
+
+- 池里是 **43 of 46 层**，剩下 3 层是混合精度层，不进 slab 缓存也就进不了池，
+  它们的每 token 流量（约 6.5% ≈ 0.17 GB）仍要走盘，约 17 ms。
+- GLM 走的是 `full-attention argmax generation path`（日志里明确），
+  不是 DeepSeek 的压缩 KV/MLA 路径，attention 侧的 GPU 开销更大，约 30 ms。
+
+也就是说：**把盘踢出去之后，GLM 剩下的不是搬运瓶颈，是它自己的 attention 计算**。
+同样的"全常驻"待遇，V4 Flash 能贴到 PCIe 的 97%，GLM 只能到 65%。
+（V4.1 的 10.8 t/s 仍是纯推算，本机装不下，没法验证。）
+
+**加内存能换到什么 / 本机还能怎么挤**
+
+| 模型 | 全常驻所需可用内存 | 怎么做到 | 速度 |
 |---|---|---|---|
-| GLM 5.3 Flash | 81.63 + 11.68 = 93.31 GiB | 128 GB（本机 93 GiB 只差 3 GiB） | 6.06 → **~11 t/s** |
-| V4.1 Flash | 142.38 + 16 = 158.4 GiB | 192 GB 级 | 6.30 → **~10.8 t/s** |
+| GLM 5.3 Flash | 81.63 GiB（+ 预留） | **本机就行**：把预留压到 6–8 GiB | 6.06 → **7.20 t/s**（实测） |
+| GLM 5.3 Flash | 81.63 + 11.68 = 93.31 GiB | 换 128 GB 内存，用默认预留 | 7.20 t/s（实测，不会更高） |
+| V4.1 Flash | 142.38 + 16 = 158.4 GiB | 192 GB 级 | 6.30 → ~10.8 t/s（**纯推算，未验证**） |
 
-GLM 的投入产出比最高：只差 3.2 GiB，加一条内存就能把盘整个踢出解码关键路径。
-本机数学上不可能——`MemAvailable` 最大 90 GiB，而 GLM 需要 93.31 GiB。
+GLM 默认预留（总内存的 1/8 = 11.68 GiB）下需要 93.31 GiB 可用，而本机
+`MemAvailable` 只有约 90 GiB，所以自动走了读透缓存。**但把预留压到 6 GiB 就够了**：
+90.7 − 6 = 84.7 GiB > 81.63 GiB。新增 `DS4_RAM_RESIDENT_RESERVE_MB` 就是为了这个——
+pinned 内存不可换出，预留该留多少是用户的取舍，不是引擎该替他决定的：
+
+```sh
+DS4_GLM_MEMORY_GUARD=0 DS4_RAM_RESIDENT_RESERVE_MB=6144 ./ds4 --cuda -m <GLM53-Q2.gguf> \
+      --ssd-streaming -c 2048 --nothink --temp 0 -n 128 -p "<prompt>"
+# → RAM-resident experts: 81.63 GiB resident in 11.8 s (7.5 GB/s)
+#   43 of 46 routed layers pinned ... generation: 7.20 t/s
+```
+
+代价：pin 完 81.63 GiB 后系统只剩约 9 GiB 给页缓存和其他进程。
+`ds4` 把自己的 `oom_score_adj` 设成 1000，真到 OOM 时先被杀的是它，不是桌面。
+预留 8 GiB 也够（实测同为 7.20 t/s），留 6–8 GiB 之间按机器上还要跑什么来定。
 
 **本机推荐参数**
 
@@ -334,9 +367,9 @@ GLM 的投入产出比最高：只差 3.2 GiB，加一条内存就能把盘整�
 ./ds4 --cuda -m <V4.1-Q2.gguf> --ssd-streaming --ssd-streaming-cache-experts 41 \
       -c 2048 --prefill-chunk 512 --nothink --temp 0 -n 128 -p "<prompt>"
 
-# GLM 5.3 Flash Q2：6.06 t/s（两个坑见下）
-DS4_GLM_MEMORY_GUARD=0 ./ds4 --cuda -m <GLM53-Q2.gguf> --ssd-streaming -c 2048 \
-      --nothink --temp 0 -n 128 -p "<prompt>"
+# GLM 5.3 Flash Q2：7.20 t/s（全常驻；不想动预留就去掉第二行，落回 6.06 t/s 的读透档）
+DS4_GLM_MEMORY_GUARD=0 DS4_RAM_RESIDENT_RESERVE_MB=6144 ./ds4 --cuda -m <GLM53-Q2.gguf> \
+      --ssd-streaming -c 2048 --nothink --temp 0 -n 128 -p "<prompt>"
 ```
 
 **GLM 在本机的两个坑**
