@@ -1,5 +1,36 @@
 # Changelog
 
+## 2026-09-19 — 修复 `make cpu` 链接失败，并新增开发环境教程
+
+**修复**：`make cpu`（CPU-only 构建，`DS4_NO_GPU`）链接失败：
+
+```
+undefined reference to `ds4_gpu_stream_expert_cache_configured_count'   # ds4.c:42475
+```
+
+是我加"expert cache: N slots"那条启动日志时引入的回归——该函数只有 CUDA 与 Metal 后端实现，
+`DS4_NO_GPU` 下没有定义，而 `ds4.c` 在这个模式下**根本不 include `ds4_gpu.h`**（`ds4.c:139`），
+所以头文件里加桩也不起作用。
+
+按项目既有约定修复，而不是新增桩：`ds4.c:387` 的注释写明 CPU-only 构建**不提供 `ds4_gpu_*` 桩**，
+"every callsite is inside !DS4_NO_GPU"——每个调用点自己包条件编译。
+因此把这段日志连同它的数据一起放进 `#ifndef DS4_NO_GPU`。
+
+**验证**：`make cpu` 编过，`./ds4 --help` 正常输出；`make cuda` 与
+`tests/test_cuda_ssd_cache` 52 项不受影响（GPU 路径本就不走这段代码）。
+
+**新增**：`docs/DEV_ENV_SETUP.md` —— 面向新手的环境教程：
+预期管理（模型 45–340 GiB，手机内存跑不动）、四条路线选择（Debian+NVIDIA / 纯 CPU /
+Termux / Mac）、逐步命令、CodeBuddy 用法、成功检查清单、排错表、下一步读什么。
+
+**Termux 那段未验证**：手上没有 Android 设备，那段基于"Android 是 Linux 内核、
+有 mmap 与 pthread"的通用步骤写成，文档里已明确标注，并给了
+`make cpu NATIVE_CPU_FLAG=` 这一规避（ARM 上 `-march=native` 常出问题）。
+
+**改动位置**：`ds4.c`、`docs/DEV_ENV_SETUP.md`（新）、`README.md`、`README_CN.md`、`changelog.md`。
+
+---
+
 ## 2026-09-19 — README 补测试环境，并把推荐命令写成各模型的最优参数
 
 **改动**：`README.md` 与 `README_CN.md` 的调优章节。

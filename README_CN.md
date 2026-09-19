@@ -411,6 +411,8 @@ turn 标记必须位于行首，角色必须交替，最后一轮必须是 `ASSI
 - [相对上游做了哪些优化](docs/OPTIMIZATIONS_VS_UPSTREAM.md)：本 fork 相对 antirez/ds4
   在 CUDA SSD 流式上的全部改动，以及逐模型的实测幅度
   （V4 Flash 4.09×、V4.1 Flash 3.54×、GLM 5.3 Flash 4.59×）。
+- [开发环境教程](docs/DEV_ENV_SETUP.md)：面向没接触过推理引擎的人，从一台干净的
+  Debian 服务器 / 无 GPU 虚拟机 / 手机 Termux 开始，把项目编出来跑起来。
 
 提交 PR 之前请先读 [CONTRIBUTING.md](CONTRIBUTING.md)。
 

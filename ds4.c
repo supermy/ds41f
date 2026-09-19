@@ -42468,6 +42468,9 @@ static void ds4_engine_print_startup_memory(
             ds4_bytes_to_gib(total),
             reset);
 
+#ifndef DS4_NO_GPU
+    /* A CPU-only build has no streaming expert cache and no ds4_gpu symbols to
+     * link against, so this summary stays behind the same guard as its data. */
     if (dynamic_expert_cache_bytes != 0) {
         /* The slot count and its VRAM cost are the two numbers that decide how
          * much of the routed set is served without a read, so state them
@@ -42489,6 +42492,7 @@ static void ds4_engine_print_startup_memory(
             fprintf(stderr, "; routed experts reside in pinned host memory");
         fprintf(stderr, "%s\n", reset);
     }
+#endif
 
     fprintf(stderr,
             "%sds4: memory detail: ctx=%d prefill_cap=%u raw_kv_rows=%u "
