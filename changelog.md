@@ -1,5 +1,80 @@
 # Changelog
 
+## 2026-09-19 — 读透式主机专家缓存：路由专家装不进内存时的降级路径（CUDA）
+
+**目标**：`--ram-resident-experts` 的语义是"全量或不装"——V4.1 Flash Q2 的 142.38 GiB 路由专家
+装不进约 78 GiB 的可用内存，于是整条路径退回每 token 全额落盘读（3.85 t/s）。
+让"装不下"这一档降级为**读透式（read-through）主机缓存**：已经读过的专家留在 pinned 主机内存里，
+后续命中用 H2D 拷贝代替 pread。
+
+**先做的零代码对照实验**（计划第 0 节，决定值不值得写这段代码）：用内核页缓存冒充读透缓存
+（`DS4_CUDA_NO_DIRECT_IO=1` + `DS4_CUDA_KEEP_MODEL_PAGES=1`），同一 prompt、`--temp 0 -n 128`：
+
+| 组 | 落盘读 | prefill t/s | 解码 t/s |
+|---|---|---|---|
+| A 当前行为（O_DIRECT + 丢弃模型页） | 316.4 GiB | 5.90 | 3.81 |
+| B1 冷页缓存第一遍 | 65.3 GiB | 4.55 | 4.97 |
+| B2/B3 页缓存已热（= 复用上限） | 0.0 GiB | 10.33 | 6.54 |
+
+B2 相对 A **+72%**，远超"≥20% 才动手"的判据：每个 token 读约 2.4 GiB，但 128 token 读掉的
+316 GiB 里，唯一字节远少于此——专家复用是真实存在的。
+
+**改动**
+
+- `ds4_cuda.cu` 新增读透式主机专家缓存（在 `g_expert_pool` 之后）：gate/up/down 各一个 arena，
+  条目按文件偏移索引（`unordered_map` + 向量），`cudaHostAlloc` 按约 1 GiB 分块分配
+  （几万次小 pinned 分配会先撞上 `vm.max_map_count`），淘汰用 CLOCK 二次机会，跳过 `refs>0`
+  与正在填充的条目。
+- 命中在 `cuda_stream_copy_worker`（前台逐专家）里返回池内指针并**取引用**，引用在
+  `cuda_stream_copy_requests` 末尾那次无条件 `cudaStreamSynchronize` 之后统一释放；
+  中止的批次也要收走引用，否则条目会永久不可淘汰，缓存慢慢变成只读。
+- 填充只在"一个 token 自己的路由"这一档发生。判据不是入口函数而是**请求里的专家数**
+  （≤ 8，可用 `DS4_HOST_EXPERT_CACHE_SLOTS` 调）：DeepSeek 的 decode 与 prefill 走的是同一个
+  `begin_selected_load`（实测 slot 数分布：6 × 1240 次 = decode，12/48 = prefill），
+  按入口区分是错的。prefill 一次扫上千专家，让它填充会把后面 token 要用的热专家冲掉。
+- `cuda_stream_prefetch_read`（整层预读）只查不填：look-ahead 不是 reuse 的证据。
+  它的引用在 `ds4_gpu_stream_expert_cache_prefetch_finish` 里、join 之后统一释放。
+- 填充路径先独占条目（`state=filling`）、锁外 memcpy、再发布：并发查到的一定是完整字节。
+- 拆卸：`ds4_gpu_cleanup`、`ds4_gpu_set_model_map`、`ds4_gpu_set_model_fd_for_map`
+  （测试会在同一个 mapping 下重写文件）三处都释放缓存。
+- `ds4.c`：路由专家装不下时改调 `ds4_gpu_host_cache_install`；`DS4_HOST_EXPERT_CACHE=off|NGB`
+  覆盖预算，`DS4_HOST_EXPERT_CACHE_STATS=1` 退出时打命中率。
+
+**改动位置**：`ds4_cuda.cu`、`ds4_gpu.h`、`ds4.c`、`ds4.h`、`ds4_help.c`、`tests/test_cuda_ssd_cache.c`。
+
+**实测（RTX 5060 Ti 16 GiB，93 GB 内存，Q2，41 槽，同一 prompt，`--temp 0 -n 128`）**
+
+| 缓存预算 | 落盘读 | 解码 t/s |
+|---|---|---|
+| 关（`DS4_HOST_EXPERT_CACHE=off`） | 316 GiB | 3.86 / 3.84 |
+| 4 GiB | 228 GiB | 4.19 |
+| 8 GiB | 168 GiB | 5.23 |
+| 16 GiB | 118 GiB | 6.23 |
+| 32 GiB | 84 GiB | 6.30 |
+| 48 GiB | 80 GiB | 6.38 |
+| 78 GiB（可用内存全给） | 80 GiB | 6.17 |
+| **默认（可用内存的 1/3 = 26.18 GiB）** | 89 GiB | **6.29 / 6.32** |
+
+默认**不是**把可用内存都吃下：曲线在 16–32 GiB 就到平台，32 GiB 已 75.7% 命中，
+78 GiB 只多 1.3 个百分点还慢一点（更多 pinned 内存挤压页缓存）。所以默认取
+`usable / 3`（上限 32 GiB），显式 `NGB` 或 `DS4_HOST_EXPERT_CACHE=NGB` 时按用户给的值走。
+默认档命中率 73.7%，227 GiB 从内存供给，81 GiB 仍走盘。
+
+正确性：四次运行（开/关各两遍）的 128 token 正文 **md5 逐字一致**。
+
+**测试**：`tests/test_cuda_ssd_cache.c` 新增用例——8 个专家的缓存装满后清空源文件
+（`ftruncate`），同一批 routed MoE 必须复现参考输出（只能来自缓存）；
+再把预算压到 2 个专家使每轮都强制淘汰，连续三轮结果仍逐字节相同。
+
+**与计划文档的偏差**
+
+- 填充开关按"请求专家数"判定，而不是按 decode/prefill 入口（原因见上）。
+- 默认预算取可用内存的 1/3 而非全部（依据上面的预算扫描）。
+- 顺序回退路径 `cuda_model_copy_to_device_streamed` 没有接缓存：它只在并行暂存起不来时才走，
+  收益面很小，先不增加一条额外路径。
+
+---
+
 ## 2026-09-18 — 文档：调优使用方法进入 README，新增中文 README，并存档下一步优化计划
 
 本次**没有改任何推理代码**，只动文档。

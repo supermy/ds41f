@@ -303,6 +303,70 @@ static void run(unsigned gate_type, unsigned down_type, unsigned dim, unsigned s
         CHECK(pwrite(fd, model, model_bytes, 0) == (ssize_t)model_bytes);
         fprintf(stderr, "CUDA SSD host-resident expert pool serves loads and read-ahead: PASS\n");
     }
+    /* Read-through host expert cache. Two things have to be true at once: a
+     * demand load fills it, and once the source file is gone the same experts
+     * still come back -- which only the cache can explain. A budget of two
+     * experts per tensor, below what one request needs, additionally proves
+     * that eviction never hands out half-written bytes. */
+    {
+        const uint64_t per_expert[3] = {gate_bytes, gate_bytes, down_bytes};
+        const uint64_t whole = 2u * gate_bytes + down_bytes;
+        const int32_t few[] = {0, 1, 2, 3};
+        uint64_t hits = 0, cached_bytes = 0;
+        CHECK(ds4_gpu_tensor_write(x, 0, input, sizeof(input)));
+        CHECK(ds4_gpu_tensor_write(si, 0, ids, sizeof(ids)));
+        CHECK(pwrite(fd, model, model_bytes, 0) == (ssize_t)model_bytes);
+        ds4_gpu_host_cache_release();
+        CHECK(ds4_gpu_host_cache_install(alias, model_bytes, per_expert[0],
+                                         per_expert[1], per_expert[2],
+                                         (uint64_t)EXPERTS * whole));
+        ds4_gpu_host_cache_stats(NULL, NULL, NULL, NULL, NULL, NULL, &cached_bytes);
+        CHECK(cached_bytes >= (uint64_t)EXPERTS * whole);
+        /* Same load twice, the second time over an empty file: everything the
+         * first pass read into the cache has to come back from it. */
+        for (unsigned pass = 0; pass < 2; pass++) {
+            const uint64_t before = hits;
+            ds4_gpu_stream_expert_cache_release_resident();
+            ds4_gpu_set_streaming_expert_cache_budget(2u * EXPERTS);
+            if (pass == 1) CHECK(ftruncate(fd, 0) == 0);
+            CHECK(ds4_gpu_stream_expert_cache_begin_selected_load(&cached, all, EXPERTS));
+            bool cache_half = false;
+            CHECK(ds4_gpu_routed_moe_batch_tensor(out, gate, up, mid, down, alias, model_bytes,
+                0, EXPERTS * gate_bytes, 2 * EXPERTS * gate_bytes,
+                gate_type, down_type, gate_bytes, gate_block, down_bytes, down_block,
+                dim, dim, dim, si, sw, EXPERTS, selected, 10, x, 0, ROWS, &cache_half, false));
+            CHECK(!cache_half && ds4_gpu_tensor_read(out, 0, actual, sizeof(actual)));
+            for (unsigned i = 0; i < ROWS * dim; i++)
+                CHECK(isfinite(actual[i]) && fabsf(actual[i] - reference[0][i]) <=
+                      2e-5f * (1 + fabsf(reference[0][i])));
+            ds4_gpu_host_cache_stats(&hits, NULL, NULL, NULL, NULL, NULL, NULL);
+            if (pass == 1) CHECK(hits - before >= 3u * EXPERTS);
+        }
+        /* Eviction: two slots per tensor cannot hold one request, so every pass
+         * reuses almost nothing and must still stay byte-exact. */
+        CHECK(pwrite(fd, model, model_bytes, 0) == (ssize_t)model_bytes);
+        ds4_gpu_host_cache_release();
+        CHECK(ds4_gpu_host_cache_install(alias, model_bytes, per_expert[0],
+                                         per_expert[1], per_expert[2], 2u * whole));
+        for (unsigned round = 0; round < 3; round++) {
+            ds4_gpu_stream_expert_cache_release_resident();
+            ds4_gpu_set_streaming_expert_cache_budget(2u * EXPERTS);
+            CHECK(ds4_gpu_stream_expert_cache_begin_selected_load(&cached, all, EXPERTS));
+            CHECK(ds4_gpu_stream_expert_cache_begin_selected_load(&cached, few, 4));
+            bool thrash_half = false;
+            CHECK(ds4_gpu_routed_moe_batch_tensor(out, gate, up, mid, down, alias, model_bytes,
+                0, EXPERTS * gate_bytes, 2 * EXPERTS * gate_bytes,
+                gate_type, down_type, gate_bytes, gate_block, down_bytes, down_block,
+                dim, dim, dim, si, sw, EXPERTS, selected, 10, x, 0, ROWS, &thrash_half, false));
+            CHECK(!thrash_half && ds4_gpu_tensor_read(out, 0, actual, sizeof(actual)));
+            for (unsigned i = 0; i < ROWS * dim; i++)
+                CHECK(isfinite(actual[i]) && fabsf(actual[i] - reference[0][i]) <=
+                      2e-5f * (1 + fabsf(reference[0][i])));
+        }
+        CHECK(pwrite(fd, model, model_bytes, 0) == (ssize_t)model_bytes);
+        ds4_gpu_host_cache_release();
+        fprintf(stderr, "CUDA SSD read-through host expert cache serves loaded experts: PASS\n");
+    }
     ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(sw); ds4_gpu_tensor_free(si);
     ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(gate); ds4_gpu_tensor_free(up);
     ds4_gpu_tensor_free(mid); ds4_gpu_tensor_free(down);

@@ -225,6 +225,9 @@ make tests/test_cuda_ssd_cache  # 关键：make cuda 不会重建测试
 | `--ram-resident-experts off\|auto\|NGB` | `auto` | `auto` 在 `MemAvailable − 预留` 装得下**全部**路由专家时，把它们在启动时 pin 进主机内存，此后 staged read 全部变成 Host→Device 拷贝。语义刻意是**要么全装、要么不装**；`NGB` 给池设上限，`off` 关闭（`DS4_RAM_RESIDENT_EXPERTS=0` 同效）。 |
 | `--host-offload-token-embd` | 关 | 把 `token_embd` 放进 pinned 主机内存，腾出约 1.2 GiB 显存。只对**每 token 只读一行**的行 gather 张量有效；被 GEMV 整块读的权重不要用这种方式卸载。 |
 | `DS4_CUDA_EXPERT_READ_DEPTH=N` | 8 | 专家 `pread` 的重叠队列深度。实测 8 是峰值，再深没有收益，只多占 pinned 内存。 |
+| `DS4_HOST_EXPERT_CACHE=off\|NGB` | 可用内存的 1/3，上限 32 GiB | 路由专家**装不进内存**时生效：读透式主机缓存把读过的专家留在 pinned 内存，命中就走 H2D 而不是 `pread`。`off` 退回纯 SSD，`NGB` 手动定预算。 |
+| `DS4_HOST_EXPERT_CACHE_STATS=1` | 未设 | 退出时打印命中率、多少字节来自内存、多少字节仍走盘。 |
+| `DS4_HOST_EXPERT_CACHE_SLOTS=N` | 8 | 「允许填充」的判定阈值 = 单个 token 的路由专家数。模型每 token 路由更多专家时要调大，否则缓存永远不会被填充。 |
 | `DS4_EXPERT_POOL_READERS=N` | 16 | 启动时一次性预载专家的线程数（按文件偏移排序、8 MiB 分块）。8/16/32 → 11.9 / 10.0 / 10.3 s，默认 16。 |
 | `DS4_CUDA_DISABLE_EXPERT_PARALLEL_READ=1` | 未设 | 串行基线。**任何 A/B 对比都要以它为基准**。 |
 
@@ -240,8 +243,26 @@ make tests/test_cuda_ssd_cache  # 关键：make cuda 不会重建测试
 | V4 Flash IQ2XXS | 专家内存池自动启用 | **13.02** |
 | V4.1 Flash Q2 | 串行读专家 | 1.93 |
 | V4.1 Flash Q2 | 并行读专家（默认） | 3.80 |
+| V4.1 Flash Q2 | 并行读专家 + 读透式主机缓存（默认 26 GiB） | **6.30** |
 
 一次性预载 72.56 GiB 用 10.0 s（7.7 GB/s），已达本机裸盘 O_DIRECT 顺序读约 90%。
+
+**读透缓存的预算扫描**（Q2，同一 prompt，`--temp 0 -n 128`）：
+
+| 缓存预算 | 落盘读 | 解码 t/s |
+|---|---|---|
+| 关 | 316 GiB | 3.86 |
+| 8 GiB | 168 GiB | 5.23 |
+| 16 GiB | 118 GiB | 6.23 |
+| 32 GiB | 84 GiB | 6.30 |
+| 78 GiB（可用内存全给） | 80 GiB | 6.17 |
+| **默认：可用内存的 1/3 = 26.18 GiB** | 89 GiB | **6.29 / 6.32** |
+
+曲线 16–32 GiB 就到平台：32 GiB 已 75.7% 命中，78 GiB 只多 1.3 个百分点反而略慢
+（更多 pinned 内存挤压页缓存）。所以默认**不**把可用内存吃满，
+要更大预算就显式给 `DS4_HOST_EXPERT_CACHE=48`。默认档命中率 73.7%，
+227 GiB 来自内存、81 GiB 仍走盘；开/关各跑两遍的正文 md5 逐字一致。
+
 本机的总体判据：**每 token 字节 × 实测 t/s ≈ 供给带宽**。
 逼近盘带宽时该做的是**削字节**（更小 checkpoint / 批处理摊薄 / 换更快的介质），
 而不是继续加管道（更大的并发、更深的预取）。
@@ -317,8 +338,8 @@ turn 标记必须位于行首，角色必须交替，最后一轮必须是 `ASSI
 - [性能](docs/PERFORMANCE.md)：可复现的测量与已记录基线。
 - [测试与开发](docs/TESTING.md)：回归测试、调试与模型构建工具。
 - [优化记录与目标](docs/OPTIMIZATION_HISTORY.md)：CUDA SSD 流式路径上每一次优化的
-  目标、做法、实测结果与被否决的方案；下一步计划见
-  [读透式主机专家缓存](docs/PLAN-host-expert-cache.md)（**已存档，尚未实施**）。
+  目标、做法、实测结果与被否决的方案；其中读透式主机专家缓存的设计笔记保留在
+  [PLAN-host-expert-cache.md](docs/PLAN-host-expert-cache.md)（已实现，作为实现记录）。
 
 提交 PR 之前请先读 [CONTRIBUTING.md](CONTRIBUTING.md)。
 

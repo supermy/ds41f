@@ -42285,6 +42285,7 @@ struct ds4_engine {
     bool ram_resident_experts_off;
     uint64_t ram_resident_experts_bytes;
     bool expert_pool_installed;
+    bool host_cache_installed;
     ds4_distributed_options distributed;
     ds4_engine_tp_state tp;
     bool metal_ready;
@@ -70105,6 +70106,88 @@ static bool ds41_memory_admit(ds4_engine *e, uint64_t graph_bytes, bool fit_cach
  * host-to-device copy. The cache, the slots and the kernels are untouched --
  * only where the bytes come from changes. All-or-nothing: a partial pool would
  * trade a large, unswappable allocation for an unpredictable hit rate. */
+/* Second best plan for hosts where the routed experts cannot all be pinned: keep
+ * whatever does fit and let demand reads populate it, so a repeatedly routed
+ * expert is served by memory instead of the drive. The reason it is worth it is
+ * invisible from the raw numbers -- a Q2 token reads ~2.4 GiB, but a 128 token
+ * run reads 316 GiB while touching far fewer unique bytes than that.
+ *
+ * Everything else about this sizing matches the resident pool: pinned memory
+ * cannot be swapped out, so whatever is left for the rest of the system is
+ * already accounted for in `usable`.
+ */
+static void ds4_engine_install_read_through_cache(ds4_engine *e,
+                                                  const uint64_t *part_bytes,
+                                                  uint64_t usable) {
+#if defined(DS4_NO_GPU) || defined(__APPLE__) || defined(DS4_ROCM_BUILD)
+    (void)e;
+    (void)part_bytes;
+    (void)usable;
+#else
+    uint64_t budget = usable;
+    if (e->ram_resident_experts_bytes == 0) {
+        /* Default to a third of what the machine can spare. The budget sweep
+         * on Q2 read 317 GiB with the cache off, 118 GiB at 16 GiB and only
+         * 84 GiB at 32 GiB, then stopped improving: past the useful expert set
+         * the extra pinned memory buys no hits and only starves the page cache
+         * and whatever else is running. NGB above overrides this entirely. */
+        budget = usable / 3u;
+        if (budget > UINT64_C(32) * 1073741824u)
+            budget = UINT64_C(32) * 1073741824u;
+    }
+    const char *env = getenv("DS4_HOST_EXPERT_CACHE");
+    if (env && env[0] && strcmp(env, "off") == 0) {
+        fprintf(stderr, "ds4: host expert cache: disabled by DS4_HOST_EXPERT_CACHE=off\n");
+        return;
+    }
+    if (env && env[0]) {
+        char *end = NULL;
+        const double gib = strtod(env, &end);
+        if (end && end != env && gib > 0) {
+            const uint64_t asked = (uint64_t)(gib * 1073741824.0);
+            budget = asked < usable ? asked : usable;
+        }
+    }
+    uint64_t per[3] = {0, 0, 0};
+    int usable_layout = 1;
+    for (unsigned k = 0; k < 3; k++) {
+        if (part_bytes[k] == 0 || DS4_N_EXPERT == 0 ||
+            part_bytes[k] % DS4_N_EXPERT != 0) {
+            usable_layout = 0;
+            break;
+        }
+        per[k] = part_bytes[k] / (uint64_t)DS4_N_EXPERT;
+    }
+    if (!usable_layout || budget == 0) {
+        fprintf(stderr, "ds4: host expert cache: unavailable for this checkpoint\n");
+        return;
+    }
+    /* Below one layer's worth of experts there is nothing to reuse across. */
+    const uint64_t sum = per[0] + per[1] + per[2];
+    const uint64_t experts = budget / sum;
+    if (experts < (uint64_t)DS4_N_EXPERT) {
+        fprintf(stderr,
+                "ds4: host expert cache: %.2f GiB holds only %llu of %u experts "
+                "per tensor; too small to reuse\n",
+                ds4_bytes_to_gib(budget), (unsigned long long)experts,
+                (unsigned)DS4_N_EXPERT);
+        return;
+    }
+    if (!ds4_gpu_host_cache_install(e->model.map, e->model.size,
+                                    per[0], per[1], per[2], budget))
+        return;
+    uint64_t resident = 0;
+    ds4_gpu_host_cache_stats(NULL, NULL, NULL, NULL, NULL, NULL, &resident);
+    fprintf(stderr,
+            "ds4: host expert cache: %.2f GiB, %llu experts x 3 tensors "
+            "(%.1f%% of one layer's %u experts); demand reads populate it\n",
+            ds4_bytes_to_gib(resident), (unsigned long long)experts,
+            (double)experts * 100.0 / (double)DS4_N_EXPERT,
+            (unsigned)DS4_N_EXPERT);
+    e->host_cache_installed = true;
+#endif
+}
+
 static void ds4_engine_install_expert_host_pool(ds4_engine *e) {
 #if defined(DS4_NO_GPU) || defined(__APPLE__) || defined(DS4_ROCM_BUILD)
     (void)e;
@@ -70120,6 +70203,10 @@ static void ds4_engine_install_expert_host_pool(ds4_engine *e) {
     uint64_t *bytes = xcalloc(3u * (size_t)DS4_N_LAYER, sizeof(uint64_t));
     uint32_t count = 0, layers = 0;
     uint64_t total = 0;
+    /* Largest gate/up/down tensor per part: the read-through cache built when
+     * the whole set does not fit needs the per-expert stride, and layers are
+     * allowed to differ. */
+    uint64_t part_bytes[3] = {0, 0, 0};
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         /* Mixed-precision layers never enter the slab cache, so a resident copy
          * of them could not be served from it either. */
@@ -70137,6 +70224,7 @@ static void ds4_engine_install_expert_host_pool(ds4_engine *e) {
         for (unsigned k = 0; k < 3; k++) {
             offsets[count] = t[k]->abs_offset;
             bytes[count] = t[k]->bytes;
+            if (t[k]->bytes > part_bytes[k]) part_bytes[k] = t[k]->bytes;
             count++;
         }
         total += add;
@@ -70173,6 +70261,7 @@ static void ds4_engine_install_expert_host_pool(ds4_engine *e) {
                 "reserve %.2f GiB)\n",
                 ds4_bytes_to_gib(total), ds4_bytes_to_gib(usable),
                 ds4_bytes_to_gib(host_avail), ds4_bytes_to_gib(reserve));
+        ds4_engine_install_read_through_cache(e, part_bytes, usable);
         free(offsets);
         free(bytes);
         return;
@@ -72404,6 +72493,26 @@ void ds4_engine_close(ds4_engine *e) {
         metal_graph_free_prefill_workspace(&e->shared_prefill_workspace);
         e->shared_prefill_workspace_ready = false;
     }
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    {
+        const char *stats_env = getenv("DS4_HOST_EXPERT_CACHE_STATS");
+        if (e->host_cache_installed && stats_env && stats_env[0]) {
+            uint64_t hits = 0, hit_bytes = 0, fills = 0, fill_bytes = 0;
+            uint64_t misses = 0, miss_bytes = 0, cache_bytes = 0;
+            ds4_gpu_host_cache_stats(&hits, &hit_bytes, &fills, &fill_bytes,
+                                     &misses, &miss_bytes, &cache_bytes);
+            fprintf(stderr,
+                    "ds4: host expert cache: %.2f GiB, %llu/%llu hits (%.1f%%), "
+                    "%.2f GiB served from memory, %.2f GiB read from disk\n",
+                    ds4_bytes_to_gib(cache_bytes),
+                    (unsigned long long)hits,
+                    (unsigned long long)(hits + misses),
+                    (double)(hits + misses) ? (double)hits * 100.0 /
+                        (double)(hits + misses) : 0.0,
+                    ds4_bytes_to_gib(hit_bytes), ds4_bytes_to_gib(miss_bytes));
+        }
+    }
+#endif
     ds4_gpu_cleanup();
 #endif
     ds4_ssd_memory_lock_release(&e->simulated_memory);

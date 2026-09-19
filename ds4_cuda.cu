@@ -2526,6 +2526,351 @@ extern "C" int ds4_gpu_expert_pool_install(const void *model_map,
     return 1;
 }
 
+/* ---------------------------------------------------------------------------
+ * Read-through host cache for routed experts.
+ *
+ * The pool above is deliberately all-or-nothing: when the routed set does not
+ * fit in RAM every staged read still comes from the drive. Letting the kernel
+ * keep the model's pages instead of dropping them is the cheap stand-in for
+ * this cache, and it answered the only question that matters before writing
+ * any of this code: on Q2 the same prompt moved 3.81 -> 6.54 t/s while
+ * reading 0 bytes from the device, so expert reuse is real -- a token reads
+ * ~2.4 GiB but touches far fewer unique bytes than that.
+ *
+ * Same shape as the device arena: one entry per (part, expert), indexed by
+ * file offset, refcounted so eviction cannot recycle bytes that are mid-copy,
+ * and filled only from the demand path, since look-ahead has not yet earned
+ * the right to displace entries that later tokens will ask for.
+ * ------------------------------------------------------------------------- */
+struct cuda_host_cache_entry {
+    uint64_t offset;
+    uint32_t state;   /* 0 empty, 1 filling, 2 readable */
+    uint32_t refs;
+    uint32_t recent;  /* CLOCK second chance */
+};
+struct cuda_host_cache_arena {
+    std::vector<void *> raw;
+    std::vector<char *> blocks;
+    std::vector<cuda_host_cache_entry> entries;
+    std::unordered_map<uint64_t, size_t> by_offset;
+    uint64_t slot_bytes = 0;
+    uint64_t slots_per_block = 0;
+    uint32_t hand = 0;
+    uint64_t hits = 0, hit_bytes = 0, fills = 0, fill_bytes = 0;
+};
+static struct {
+    pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+    int live = 0;
+    /* Filling from prefill would sweep its way through the whole expert set
+     * and evict the entries decode keeps asking for. */
+    int allow_fill = 0;
+    const void *model_map = NULL;
+    uint64_t model_size = 0;
+    uint64_t budget_bytes = 0;
+    uint64_t misses = 0, miss_bytes = 0;
+    uint64_t full = 0;
+    cuda_host_cache_arena arena[3];
+} g_host_cache;
+
+/* Reference tokens carry the arena in the high bits so one value can be
+ * parked next to a copy request and released where the copy is known to have
+ * landed. */
+#define CUDA_HOST_CACHE_REF(part, index) \
+    (((uint64_t)(part) << 56) | (uint64_t)(index))
+
+static char *cuda_host_cache_slot_ptr(const cuda_host_cache_arena &a, size_t index) {
+    return a.blocks[index / a.slots_per_block] +
+           (index % a.slots_per_block) * a.slot_bytes;
+}
+
+static void cuda_host_cache_release_locked(void) {
+    for (unsigned i = 0; i < 3; i++) {
+        cuda_host_cache_arena &a = g_host_cache.arena[i];
+        for (size_t b = 0; b < a.raw.size(); b++)
+            if (a.raw[b]) (void)cudaFreeHost(a.raw[b]);
+        a.raw.clear();
+        a.blocks.clear();
+        a.entries.clear();
+        a.by_offset.clear();
+        a.slot_bytes = a.slots_per_block = 0;
+        a.hand = 0;
+        a.hits = a.hit_bytes = a.fills = a.fill_bytes = 0;
+    }
+    g_host_cache.live = 0;
+    g_host_cache.model_map = NULL;
+    g_host_cache.model_size = 0;
+    g_host_cache.budget_bytes = 0;
+    g_host_cache.misses = g_host_cache.miss_bytes = g_host_cache.full = 0;
+}
+
+static void cuda_host_cache_release(void) {
+    pthread_mutex_lock(&g_host_cache.mutex);
+    cuda_host_cache_release_locked();
+    pthread_mutex_unlock(&g_host_cache.mutex);
+}
+
+extern "C" void ds4_gpu_host_cache_release(void) {
+    cuda_host_cache_release();
+}
+
+extern "C" void ds4_gpu_host_cache_set_fill(int allow) {
+    pthread_mutex_lock(&g_host_cache.mutex);
+    g_host_cache.allow_fill = allow ? 1 : 0;
+    pthread_mutex_unlock(&g_host_cache.mutex);
+}
+
+extern "C" void ds4_gpu_host_cache_stats(uint64_t *hits, uint64_t *hit_bytes,
+                                         uint64_t *fills, uint64_t *fill_bytes,
+                                         uint64_t *misses, uint64_t *miss_bytes,
+                                         uint64_t *bytes) {
+    uint64_t h = 0, hb = 0, f = 0, fb = 0, total = 0;
+    pthread_mutex_lock(&g_host_cache.mutex);
+    for (unsigned i = 0; i < 3; i++) {
+        const cuda_host_cache_arena &a = g_host_cache.arena[i];
+        h += a.hits; hb += a.hit_bytes; f += a.fills; fb += a.fill_bytes;
+        total += (uint64_t)a.entries.size() * a.slot_bytes;
+    }
+    const uint64_t mi = g_host_cache.misses, mb = g_host_cache.miss_bytes;
+    pthread_mutex_unlock(&g_host_cache.mutex);
+    if (hits) *hits = h;
+    if (hit_bytes) *hit_bytes = hb;
+    if (fills) *fills = f;
+    if (fill_bytes) *fill_bytes = fb;
+    if (misses) *misses = mi;
+    if (miss_bytes) *miss_bytes = mb;
+    if (bytes) *bytes = total;
+}
+
+/* A hit takes a reference: the caller's H2D copy is asynchronous, so the entry
+ * has to outlive the copies it feeds. Returns NULL on a miss. */
+static const char *cuda_host_cache_lookup(unsigned part, const void *model_map,
+                                          uint64_t offset, uint64_t bytes,
+                                          uint64_t *token) {
+    if (token) *token = 0;
+    if (!g_host_cache.live || part > 2 || bytes == 0) return NULL;
+    pthread_mutex_lock(&g_host_cache.mutex);
+    if (!g_host_cache.live) {
+        pthread_mutex_unlock(&g_host_cache.mutex);
+        return NULL;
+    }
+    if (model_map && g_host_cache.model_map && model_map != g_host_cache.model_map) {
+        pthread_mutex_unlock(&g_host_cache.mutex);
+        return NULL;
+    }
+    cuda_host_cache_arena &a = g_host_cache.arena[part];
+    if (bytes != a.slot_bytes) {
+        pthread_mutex_unlock(&g_host_cache.mutex);
+        return NULL;
+    }
+    const auto found = a.by_offset.find(offset);
+    if (found == a.by_offset.end()) {
+        g_host_cache.misses++;
+        g_host_cache.miss_bytes += bytes;
+        pthread_mutex_unlock(&g_host_cache.mutex);
+        return NULL;
+    }
+    cuda_host_cache_entry &e = a.entries[found->second];
+    if (e.state != 2) {
+        pthread_mutex_unlock(&g_host_cache.mutex);
+        return NULL;
+    }
+    e.refs++;
+    e.recent = 1;
+    a.hits++;
+    a.hit_bytes += bytes;
+    const size_t index = found->second;
+    pthread_mutex_unlock(&g_host_cache.mutex);
+    if (token) *token = CUDA_HOST_CACHE_REF(part, index);
+    return cuda_host_cache_slot_ptr(a, index);
+}
+
+static void cuda_host_cache_unref(uint64_t token) {
+    if (!token) return;
+    const unsigned part = (unsigned)(token >> 56);
+    const size_t index = (size_t)(token & ((UINT64_C(1) << 56) - 1));
+    if (part > 2) return;
+    pthread_mutex_lock(&g_host_cache.mutex);
+    if (g_host_cache.live && index < g_host_cache.arena[part].entries.size()) {
+        cuda_host_cache_entry &e = g_host_cache.arena[part].entries[index];
+        if (e.refs) e.refs--;
+    }
+    pthread_mutex_unlock(&g_host_cache.mutex);
+}
+
+/* Claim a slot exclusively, copy the bytes outside the lock, then publish. The
+ * entry is invisible until the data is complete, so a concurrent lookup either
+ * misses or sees finished bytes, never a partial expert. */
+static void cuda_host_cache_fill(unsigned part, const void *model_map,
+                                 uint64_t offset, uint64_t bytes,
+                                 const char *src) {
+    if (!g_host_cache.live || part > 2 || !src || bytes == 0) return;
+    pthread_mutex_lock(&g_host_cache.mutex);
+    if (!g_host_cache.live || !g_host_cache.allow_fill) {
+        pthread_mutex_unlock(&g_host_cache.mutex);
+        return;
+    }
+    if (model_map && g_host_cache.model_map && model_map != g_host_cache.model_map) {
+        pthread_mutex_unlock(&g_host_cache.mutex);
+        return;
+    }
+    cuda_host_cache_arena &a = g_host_cache.arena[part];
+    if (bytes != a.slot_bytes || a.entries.empty()) {
+        pthread_mutex_unlock(&g_host_cache.mutex);
+        return;
+    }
+    if (a.by_offset.find(offset) != a.by_offset.end()) {
+        pthread_mutex_unlock(&g_host_cache.mutex);
+        return;
+    }
+    const size_t total = a.entries.size();
+    uint32_t hand = a.hand;
+    size_t victim = (size_t)-1;
+    for (size_t tried = 0; tried < 2 * total; tried++) {
+        cuda_host_cache_entry &c = a.entries[hand];
+        if (c.refs == 0 && c.state != 1) {
+            if (!c.recent) { victim = hand; break; }
+            c.recent = 0;
+        }
+        hand = (hand + 1u) % (uint32_t)total;
+    }
+    if (victim == (size_t)-1) {
+        g_host_cache.full++;
+        pthread_mutex_unlock(&g_host_cache.mutex);
+        return;
+    }
+    cuda_host_cache_entry &e = a.entries[victim];
+    if (e.state == 2) a.by_offset.erase(e.offset);
+    e.offset = offset;
+    e.state = 1;
+    e.refs = 0;
+    e.recent = 0;
+    a.hand = (hand + 1u) % (uint32_t)total;
+    char *dst = cuda_host_cache_slot_ptr(a, victim);
+    pthread_mutex_unlock(&g_host_cache.mutex);
+
+    memcpy(dst, src, (size_t)bytes);
+
+    pthread_mutex_lock(&g_host_cache.mutex);
+    if (!g_host_cache.live) {
+        pthread_mutex_unlock(&g_host_cache.mutex);
+        return;
+    }
+    const bool taken = a.by_offset.find(offset) != a.by_offset.end();
+    if (taken) {
+        /* Another loader published the same range first; keep only one. */
+        e.state = 0;
+    } else {
+        try {
+            a.by_offset[offset] = victim;
+            e.state = 2;
+            a.fills++;
+            a.fill_bytes += bytes;
+        } catch (...) {
+            e.state = 0;
+        }
+    }
+    pthread_mutex_unlock(&g_host_cache.mutex);
+}
+
+static void cuda_host_cache_arena_reset(cuda_host_cache_arena &a) {
+    for (size_t b = 0; b < a.raw.size(); b++)
+        if (a.raw[b]) (void)cudaFreeHost(a.raw[b]);
+    a.raw.clear();
+    a.blocks.clear();
+    a.entries.clear();
+    a.by_offset.clear();
+}
+
+/* One allocation per ~1 GiB of experts: tens of thousands of small pinned
+ * allocations would hit vm.max_map_count long before the budget does. Every
+ * block has to hold the same number of slots, because a slot's address is
+ * derived by division, so a failure halves the block size and starts over. */
+static int cuda_host_cache_alloc_arena(cuda_host_cache_arena &a,
+                                       uint64_t slot_bytes, uint64_t slots) {
+    if (slot_bytes == 0 || slots == 0 || slot_bytes > SIZE_MAX) return 0;
+    uint64_t per_block = (UINT64_C(1) << 30) / slot_bytes;
+    if (per_block == 0) per_block = 1;
+    for (;;) {
+        cuda_host_cache_arena_reset(a);
+        a.slot_bytes = slot_bytes;
+        a.slots_per_block = per_block;
+        try {
+            a.entries.resize((size_t)slots);
+        } catch (...) {
+            a.slots_per_block = 0;
+            return 0;
+        }
+        uint64_t left = slots;
+        while (left) {
+            const uint64_t want = per_block < left ? per_block : left;
+            void *raw = NULL;
+            if (cudaHostAlloc(&raw, (size_t)(want * slot_bytes), 0) != cudaSuccess) {
+                (void)cudaGetLastError();
+                break;
+            }
+            try {
+                a.raw.push_back(raw);
+                a.blocks.push_back((char *)raw);
+            } catch (...) {
+                (void)cudaFreeHost(raw);
+                break;
+            }
+            left -= want;
+        }
+        if (left == 0) return 1;
+        if (per_block <= 1) {
+            cuda_host_cache_arena_reset(a);
+            a.slots_per_block = 0;
+            return 0;
+        }
+        per_block /= 2u;
+    }
+}
+
+extern "C" int ds4_gpu_host_cache_install(const void *model_map,
+                                          uint64_t model_size,
+                                          uint64_t gate_per,
+                                          uint64_t up_per,
+                                          uint64_t down_per,
+                                          uint64_t budget_bytes) {
+    if (!model_map || model_size == 0) return 0;
+    const uint64_t per[3] = {gate_per, up_per, down_per};
+    uint64_t sum = 0;
+    for (unsigned i = 0; i < 3; i++) {
+        if (per[i] == 0) return 0;
+        if (per[i] > UINT64_MAX - sum) return 0;
+        sum += per[i];
+    }
+    /* One jth expert costs gate+up+down together: sizing the arenas by the sum
+     * keeps the host footprint inside the budget instead of three times it. */
+    uint64_t experts = budget_bytes / sum;
+    if (experts == 0) return 0;
+    if (experts > (UINT64_C(1) << 31)) experts = UINT64_C(1) << 31;
+    if (ds4_gpu_set_current_device(0) != 0) return 0;
+
+    cuda_host_cache_arena fresh[3];
+    int ok = 1;
+    for (unsigned i = 0; ok && i < 3; i++)
+        ok = cuda_host_cache_alloc_arena(fresh[i], per[i], experts);
+    for (unsigned i = 0; i < 3; i++) {
+        if (ok) continue;
+        cuda_host_cache_arena_reset(fresh[i]);
+        fresh[i].slots_per_block = 0;
+    }
+    if (!ok) return 0;
+
+    pthread_mutex_lock(&g_host_cache.mutex);
+    cuda_host_cache_release_locked();
+    for (unsigned i = 0; i < 3; i++) g_host_cache.arena[i] = fresh[i];
+    g_host_cache.live = 1;
+    g_host_cache.allow_fill = 0;
+    g_host_cache.model_map = model_map;
+    g_host_cache.model_size = model_size;
+    g_host_cache.budget_bytes = experts * sum;
+    pthread_mutex_unlock(&g_host_cache.mutex);
+    return 1;
+}
+
 static void cuda_stream_selected_stage_release(void) {
     for (size_t i = 0; i < 4; i++) {
         if (g_stream_selected_stage_event[i]) {
@@ -3252,6 +3597,9 @@ extern "C" void ds4_gpu_cleanup(void) {
     cuda_q8_f16_cache_release_all();
     /* The pool owns pinned host memory no copy stream may still be reading. */
     cuda_expert_pool_release();
+    /* The read-through cache owns pinned host memory no request may hand out
+     * once this device is going away. */
+    cuda_host_cache_release();
     g_q8_f16_disabled_after_oom = 0;
     g_q8_f16_budget_notice_printed = 0;
     for (const cuda_q8_f32_range &r : g_q8_f32_ranges) {
@@ -4103,6 +4451,8 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     if (!model_map || model_size == 0) return 0;
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
     cuda_stream_selected_cache_release();
+    /* A different model means every cached expert offset is meaningless. */
+    cuda_host_cache_release();
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
@@ -27495,6 +27845,10 @@ enum { CUDA_STREAM_COPY_MAX_READERS = 32u };
 struct cuda_stream_copy_request {
     char *destination;
     uint64_t offset, bytes;
+    /* Which of the three expert tensors this one belongs to: the host expert
+     * cache keeps one arena per part, and guessing from the size would pick
+     * the wrong arena whenever gate and down are the same size. */
+    uint32_t part;
 };
 struct cuda_stream_copy_pool {
     pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -27514,6 +27868,10 @@ struct cuda_stream_copy_pool {
     /* Set when the worker served the request from the pinned host pool: no
      * bytes were read, so the file-page bookkeeping below must be skipped. */
     unsigned from_pool[CUDA_STREAM_COPY_MAX_READERS] = {};
+    /* A hit in the read-through host cache hands the dispatcher a pointer into
+     * a non-swappable arena, so the entry carries a reference until every copy
+     * that reads it has landed. */
+    uint64_t cache_ref[CUDA_STREAM_COPY_MAX_READERS] = {};
     const void *model_map = NULL;
     int fd = -1, direct_fd = -1;
     uint64_t align = 1, file_size = 0, stage_bytes = 0;
@@ -27604,6 +27962,7 @@ static void *cuda_stream_copy_worker(void *arg) {
         int owned_direct = direct_fd;
         const char *payload = NULL;
         int ok;
+        uint64_t cache_ref = 0;
         const char *resident = cuda_expert_pool_lookup(model_map, request.offset,
                                                        request.bytes);
         if (resident) {
@@ -27612,10 +27971,21 @@ static void *cuda_stream_copy_worker(void *arg) {
             payload = resident;
             ok = 1;
         } else {
-            ok = fd >= 0 && stage &&
-                cuda_model_stage_read_from(fd, &owned_direct, align, file_size,
-                                           stage, stage_bytes, request.offset,
-                                           request.bytes, &payload);
+            const char *cached = cuda_host_cache_lookup(request.part, model_map,
+                                                        request.offset,
+                                                        request.bytes, &cache_ref);
+            if (cached) {
+                payload = cached;
+                ok = 1;
+            } else {
+                ok = fd >= 0 && stage &&
+                    cuda_model_stage_read_from(fd, &owned_direct, align, file_size,
+                                               stage, stage_bytes, request.offset,
+                                               request.bytes, &payload);
+                if (ok)
+                    cuda_host_cache_fill(request.part, model_map, request.offset,
+                                         request.bytes, payload);
+            }
         }
         if (owned_direct != direct_fd) {
             pthread_mutex_lock(&pool.mutex);
@@ -27626,7 +27996,8 @@ static void *cuda_stream_copy_worker(void *arg) {
         pthread_mutex_lock(&pool.mutex);
         pool.read_ok[index] = (unsigned)(ok != 0);
         pool.payloads[index] = ok ? payload : NULL;
-        pool.from_pool[index] = (unsigned)(resident != NULL);
+        pool.from_pool[index] = (unsigned)(resident != NULL || cache_ref != 0);
+        pool.cache_ref[index] = cache_ref;
         pool.answered[index] = ticket;
         pthread_cond_broadcast(&pool.landed);
         pthread_mutex_unlock(&pool.mutex);
@@ -27726,6 +28097,8 @@ static int cuda_stream_copy_requests(const cuda_stream_copy_request *requests,
     size_t slot_request[CUDA_STREAM_COPY_MAX_READERS] = {};
     unsigned expect[CUDA_STREAM_COPY_MAX_READERS] = {};
     bool recorded[CUDA_STREAM_COPY_MAX_READERS] = {};
+    uint64_t cache_refs[CUDA_STREAM_COPY_MAX_READERS] = {};
+    size_t n_cache_refs = 0;
     pthread_mutex_lock(&pool.mutex);
     pool.fd = fd;
     pool.direct_fd = direct_fd;
@@ -27829,6 +28202,16 @@ static int cuda_stream_copy_requests(const cuda_stream_copy_request *requests,
         slot_busy[i] = false;
     }
     pthread_mutex_unlock(&pool.mutex);
+    /* Collect whatever a worker parked, whether its request was consumed or
+     * dropped by an aborted batch: an unreleased reference makes the entry
+     * unevictable for good, which slowly turns the cache read-only. */
+    for (unsigned i = 0; i < live; i++) {
+        pthread_mutex_lock(&pool.mutex);
+        const uint64_t ref = pool.cache_ref[i];
+        pool.cache_ref[i] = 0;
+        pthread_mutex_unlock(&pool.mutex);
+        if (ref) cache_refs[n_cache_refs++] = ref;
+    }
     /* Every slot starts its next read only after this wait, and no consumer
      * stream may touch these destinations before the copies have landed. */
     const int drained = cuda_ok(cudaStreamSynchronize(g_stream_copy_stream),
@@ -27837,6 +28220,7 @@ static int cuda_stream_copy_requests(const cuda_stream_copy_request *requests,
         memset(landed, 0, count * sizeof(landed[0]));
         ok = 0;
     }
+    for (size_t i = 0; i < n_cache_refs; i++) cuda_host_cache_unref(cache_refs[i]);
     pthread_mutex_lock(&pool.mutex);
     pool.fd = -1;
     pool.direct_fd = -1;
@@ -27881,6 +28265,23 @@ static int cuda_stream_selected_cache_begin_load(
     }
     if (!cuda_ok(cudaStreamSynchronize(cuda_decode_stream()), "stream expert reuse wait"))
         return 0;
+    /* Whether this load may populate the read-through host cache is decided by
+     * how many experts are being asked for, not by which entry point got here:
+     * the same one serves both halves of the run. One token's routing is six
+     * or eight experts; a prefill batch is that times hundreds of tokens, and
+     * letting it fill would sweep experts no following token has asked for
+     * yet, evicting exactly the entries the next token wants. Models that
+     * route more per token need DS4_HOST_EXPERT_CACHE_SLOTS raised to match. */
+    static unsigned max_fill_slots = 0;
+    if (!max_fill_slots) {
+        max_fill_slots = 8;
+        const char *env = getenv("DS4_HOST_EXPERT_CACHE_SLOTS");
+        if (env && env[0]) {
+            const long v = strtol(env, NULL, 10);
+            if (v >= 1 && v <= 4096) max_fill_slots = (unsigned)v;
+        }
+    }
+    ds4_gpu_host_cache_set_fill(slot_count <= max_fill_slots);
     try {
         std::vector<int32_t> expert_to_slot(table->n_total_expert, -1);
         std::vector<int32_t> unique, remap(slot_count);
@@ -28021,7 +28422,7 @@ static int cuda_stream_selected_cache_begin_load(
                     part == 1u ? cache.up_ptr : cache.down_ptr;
                 for (const auto &pair : missing)
                     requests.push_back({base + (uint64_t)pair.second * per_expert,
-                        offset + (uint64_t)pair.first * per_expert, per_expert});
+                        offset + (uint64_t)pair.first * per_expert, per_expert, part});
             }
         } catch (...) {
             return 0;
@@ -28109,6 +28510,11 @@ struct cuda_stream_prefetch_slot {
 struct cuda_stream_prefetch_copy {
     char *destination;
     uint64_t offset, bytes;
+    /* Set when those bytes already live in the read-through host cache: the
+     * reference is held until every queued copy has landed. NULL only means
+     * "not from the cache", a hit still keeps its pointer below. */
+    const char *host;
+    uint32_t part;
 };
 static struct {
     pthread_t thread;
@@ -28117,6 +28523,9 @@ static struct {
     ds4_gpu_stream_expert_table table = {};
     std::vector<cuda_stream_prefetch_slot> slots;
     std::vector<cuda_stream_prefetch_copy> copies;
+    /* References taken while building copies above: the reader holds them so
+     * its own look-ahead cannot evict bytes it is still copying. */
+    std::vector<uint64_t> refs;
     int fd = -1, direct_fd = -1, device = 0;
     uint64_t align = 1, file_size = 0, bytes = 0;
     void *stage_raw[2] = {};
@@ -28161,6 +28570,8 @@ static void *cuda_stream_prefetch_read(void *) {
             const uint64_t bytes = std::min(chunk, copy.bytes - offset);
             const char *resident = cuda_expert_pool_lookup(p.table.model_map,
                                                            copy.offset + offset, bytes);
+            if (!resident && copy.host)
+                resident = copy.host + offset;
             if (resident) {
                 /* Already pinned in host memory: no pread and no staging ring.
                  * Back-to-back copies on one stream keep H2D saturated -- the
@@ -28232,6 +28643,8 @@ extern "C" void ds4_gpu_stream_expert_cache_prefetch_finish(bool cancel) {
             (cuda_wall_sec() - start) * 1000, publish);
     p.slots.clear();
     p.copies.clear();
+    for (size_t i = 0; i < p.refs.size(); i++) cuda_host_cache_unref(p.refs[i]);
+    p.refs.clear();
     p.ok = false;
     if (p.fd >= 0) close(p.fd);
     if (p.direct_fd >= 0) close(p.direct_fd);
@@ -28337,10 +28750,18 @@ extern "C" int ds4_gpu_stream_expert_cache_prefetch(
                 const uint64_t bytes = part == 2 ? next->down_expert_bytes : next->gate_expert_bytes;
                 const uint64_t offset = part == 0 ? slot.value.gate : part == 1 ? slot.value.up : slot.value.down;
                 char *dst = (part == 0 ? cache.gate_ptr : part == 1 ? cache.up_ptr : cache.down_ptr) + slot.index * bytes;
-                if (!p.copies.empty() && p.copies.back().offset + p.copies.back().bytes == offset &&
+                uint64_t ref = 0;
+                const char *host = cuda_host_cache_lookup(part, next->model_map,
+                                                          offset, bytes, &ref);
+                if (host) p.refs.push_back(ref);
+                /* A cached range and a range that must be read are different
+                 * sources; merging them across the boundary would point one
+                 * copy at the wrong memory. */
+                if (!p.copies.empty() && !host && !p.copies.back().host &&
+                    p.copies.back().offset + p.copies.back().bytes == offset &&
                     p.copies.back().destination + p.copies.back().bytes == dst)
                     p.copies.back().bytes += bytes;
-                else p.copies.push_back({dst, offset, bytes});
+                else p.copies.push_back({dst, offset, bytes, host, part});
             }
         }
         if (p.slots.empty()) {
@@ -34522,6 +34943,9 @@ extern "C" int ds4_gpu_commit_and_wait_selected_readback(
 extern "C" int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map) {
     const int ok = ds4_gpu_set_model_fd(fd);
     if (ok) g_model_fd_host_base = model_map;
+    /* The tests rewrite the same file under the same mapping; keeping cached
+     * experts across that rewrite would serve stale bytes. */
+    cuda_host_cache_release();
     return ok;
 }
 

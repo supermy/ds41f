@@ -306,6 +306,21 @@ int ds4_gpu_expert_pool_install(const void *model_map,
                                 uint32_t count);
 void ds4_gpu_expert_pool_release(void);
 uint64_t ds4_gpu_expert_pool_bytes(void);
+/* Read-through host cache for the routed experts that do not fit in RAM: a
+ * demand read keeps a copy in pinned memory, so a later token finds the same
+ * expert without touching the drive. Returns 1 once installed. */
+int ds4_gpu_host_cache_install(const void *model_map,
+                              uint64_t model_size,
+                              uint64_t gate_per,
+                              uint64_t up_per,
+                              uint64_t down_per,
+                              uint64_t budget_bytes);
+void ds4_gpu_host_cache_release(void);
+void ds4_gpu_host_cache_set_fill(int allow);
+void ds4_gpu_host_cache_stats(uint64_t *hits, uint64_t *hit_bytes,
+                              uint64_t *fills, uint64_t *fill_bytes,
+                              uint64_t *misses, uint64_t *miss_bytes,
+                              uint64_t *bytes);
 #endif
 /* Reset only the prompt-local eviction heuristic.  The resident SSD expert
  * cache itself is intentionally kept warm across sessions. */

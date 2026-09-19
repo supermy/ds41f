@@ -240,6 +240,8 @@ Flags that matter, and when to reach for them:
 | `--ram-resident-experts off\|auto\|NGB` | `auto` | `auto` pins the whole routed expert set in host memory when `MemAvailable − reserve` can hold it, turning staged reads into host-to-device copies. It is all-or-nothing on purpose; use `NGB` to cap the pool, `off` to disable. `DS4_RAM_RESIDENT_EXPERTS=0` also disables it. |
 | `--host-offload-token-embd` | off | Frees ~1.2 GiB of VRAM by keeping `token_embd` in pinned host memory. Only worth hiding tensors that are gathered *one row per token*; never move whole-matrix GEMV weights this way. |
 | `DS4_CUDA_EXPERT_READ_DEPTH=N` | 8 | Queue depth for overlapping expert `pread`s. 8 was the measured peak; beyond that there is no gain, only more pinned memory. |
+| `DS4_HOST_EXPERT_CACHE=off\|NGB` | 1/3 of usable host memory, capped at 32 GiB | Applies when the routed experts do **not** fit in RAM: a read-through host cache keeps experts that were already read, so later hits are host-to-device copies instead of `pread`s. Set `off` to fall back to pure SSD, or `NGB` to size it. |
+| `DS4_HOST_EXPERT_CACHE_STATS=1` | unset | Prints the cache's hit rate and how many bytes came from memory vs the drive, at exit. |
 | `DS4_EXPERT_POOL_READERS=N` | 16 | Threads used for the one-shot expert pin at startup (8 MiB blocks, offset-sorted). |
 | `DS4_CUDA_DISABLE_EXPERT_PARALLEL_READ=1` | unset | Serial baseline. Every A/B comparison should be measured against this. |
 
@@ -255,6 +257,14 @@ Measured on an RTX 5060 Ti 16 GiB with 93 GB of RAM, same prompt, `--temp 0`:
 | V4 Flash IQ2XXS | expert pool auto-enabled | **13.02** |
 | V4.1 Flash Q2 | serial expert reads | 1.93 |
 | V4.1 Flash Q2 | parallel reads (default) | 3.80 |
+| V4.1 Flash Q2 | + read-through host cache (default 26 GiB) | **6.30** |
+
+On Q2 the read-through cache cuts the bytes that reach the drive from 316 GiB to 89 GiB
+over a 128-token run (73.7% hit rate), which is where the whole gain comes from.
+The budget sweep flattens quickly — 8 GiB / 16 GiB / 32 GiB / 78 GiB measured
+5.23 / 6.23 / 6.30 / 6.17 t/s — so the default takes a third of the usable host memory
+rather than all of it; the extra pinned memory buys almost no hits and only starves the
+page cache. Pass `DS4_HOST_EXPERT_CACHE=48` (GiB) if you measured otherwise on your box.
 
 Pitfalls worth knowing before you start tuning:
 
@@ -328,7 +338,7 @@ DGX Spark results, comparison conditions, and benchmark commands.
 - [Coding agent clients](docs/CLIENTS.md): Pi, OpenCode, Codex CLI, and Claude Code.
 - [Performance](docs/PERFORMANCE.md): reproducible measurements and recorded baselines.
 - [Testing and development](docs/TESTING.md): regression tests, debugging, and model-building tools.
-- [Optimization history and goals](docs/OPTIMIZATION_HISTORY.md): every CUDA SSD-streaming pass, its measured result, and what was rejected — plus [the next planned step](docs/PLAN-host-expert-cache.md), archived and not implemented yet.
+- [Optimization history and goals](docs/OPTIMIZATION_HISTORY.md): every CUDA SSD-streaming pass, its measured result, and what was rejected. The read-through host expert cache it describes has since landed; [its design notes](docs/PLAN-host-expert-cache.md) are kept as an implementation record.
 
 Local tuning notes, in Chinese: root-level `优化步骤教程.md`
 (build → baseline → concurrency sweep → debugging hangs → regression).

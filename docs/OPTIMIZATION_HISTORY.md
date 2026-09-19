@@ -7,7 +7,7 @@ NVMe（Fanxiang S910Pro 2TB，`/data` 为 ext4 on nvme1n1p6）、CUDA 13.3。
 
 文档索引
 
-- 随时更新的当前计划：[PLAN-host-expert-cache.md](PLAN-host-expert-cache.md)（**已存档，尚未实施**）
+- 读透式主机专家缓存的方案与偏差：[PLAN-host-expert-cache.md](PLAN-host-expert-cache.md)（已实现）
 - 调优后的实用命令：仓库根目录 `优化步骤教程.md`、[中文 README](../README_CN.md) 的
   「SSD 流式调优」章节、[英文 README](../README.md) 的 "SSD streaming tuning" 章节
 - 流式机制本身：[SSD_STREAMING.md](SSD_STREAMING.md)
@@ -19,17 +19,20 @@ NVMe（Fanxiang S910Pro 2TB，`/data` 为 ext4 on nvme1n1p6）、CUDA 13.3。
 
 **当前目标清单（按优先级）**
 
-1. **读透式主机专家缓存**（[计划文档](PLAN-host-expert-cache.md)，**已存档、未实施**）：
-   覆盖 Q2 这类「专家装不进内存」的模型，估算 3.80 → ~6.9 t/s。
-   动工前必须先做计划里第 0 节的零代码对照实验，提升 < 20% 就回来讨论。
-2. **批处理解码**：同批 token 复用同一层的专家权重——GPU 侧纯吞吐提升，不需要写新内核
+1. **批处理解码**：同批 token 复用同一层的专家权重——GPU 侧纯吞吐提升，不需要写新内核
    （batch 8 时每 token 专家数 6 → 5.5，batch 32 → 4.25）。
-3. **更小检查点**：IQ2XXS 相对 Q2 每 token 流量少约 7.5 倍，是最直接的杠杆。
+2. **更小检查点**：IQ2XXS 相对 Q2 每 token 流量少约 7.5 倍，是最直接的杠杆。
+3. **把读透缓存也接到 prefill**：目前 prefill 只查不填（第 4 节），
+   长 prompt 的 prefill 仍在全额落盘读；若要动，先量清楚它会不会把解码的热专家冲掉。
 
-**已完成并固化的两个目标**
+**已完成并固化的目标**
 
 - 串行 pread → 滑动窗口并发预取：V4.1 Q2 解码 1.93 → 3.80 t/s（第 1 节）。
 - 每 token 落盘读 → pinned 主机内存直拷：V4 Flash IQ2XXS 解码 7.22 → 13.02 t/s（第 3 节）。
+- 装不进内存时的读透式主机缓存：V4.1 Q2 解码 3.85 → 6.30 t/s（第 4 节）。
+
+**下一个目标**（[计划文档](PLAN-host-expert-cache.md) 已转为实现记录）：批处理解码，
+同批 token 复用同一层的专家权重；以及更小检查点这一最直接的杠杆。
 
 ## 一句话结论（判据）
 
@@ -40,7 +43,7 @@ NVMe（Fanxiang S910Pro 2TB，`/data` 为 ext4 on nvme1n1p6）、CUDA 13.3。
    逼近了就说明该**削字节**（更小检查点 / 批处理摊薄 / 命中更快的介质），
    而不是加管道（更大并发、更深的预取）。
 2. 也不要指望"<｜hy_place▁holder▁no▁813｜>计算位置"：把 MoE 挪到 CPU 在 decoded 稳态是净亏损
-   （见第 5 节），因为没有一个新的字节来源。
+   （见第 6 节），因为没有一个新的字节来源。
 
 ## 时间线总览
 
@@ -51,8 +54,8 @@ NVMe（Fanxiang S910Pro 2TB，`/data` 为 ext4 on nvme1n1p6）、CUDA 13.3。
 | 2026-09-17 | （评估）MoE 放 CPU 计算 | ds4 CPU 后端 / llama.cpp / 带宽实测 | CPU 后端 0.06 t/s，上限约 2 倍 | 否决 |
 | 2026-09-18 | 腾出显存 | `--host-offload-token-embd` | 显存 −1.2 GiB，速度不变 | 已实现 |
 | 2026-09-18 | 消灭整块落盘读 | `--ram-resident-experts`（全量常驻 pinned 池） | V4 Flash IQ2XXS：7.22 → **13.02** | 已实现 |
+| 2026-09-19 | 覆盖「装不进内存」的模型 | 读透式主机专家缓存 | V4.1 Q2：3.85 → **6.30** | 已实现 |
 | 2026-09-18 | （评估）SSD→内存跨层预取 | 盘带宽 / 放大倍数核算 | 增益 ≈ 0（解码已在盘带宽上限） | 否决 |
-| 2026-09-18 | 覆盖「装不进内存」的模型 | 读透式主机专家缓存 | 估算 3.80 → ~6.9 | **计划已存档，未实施** |
 
 ## 1. 2026-09-17 — 路由专家预取并行化（V4.1 Flash Q2）
 
@@ -128,7 +131,66 @@ NVMe（Fanxiang S910Pro 2TB，`/data` 为 ext4 on nvme1n1p6）、CUDA 13.3。
 （`ds4.c:41713`，注释写明低于 2K 时无用读取超过收益）；解码真正受益的是
 `cuda_stream_copy_worker` 里的 host-pool 命中直拷。
 
-## 4. 2026-09-18 —（评估否决）SSD→内存跨层异步预取
+## 4. 2026-09-19 — 读透式主机专家缓存（V4.1 Flash Q2）
+
+**目标**：`--ram-resident-experts` 是「全量或不装」，Q2 的 142.38 GiB 路由专家装不进约 78 GiB
+可用内存，于是被整包跳过、停在 3.85 t/s。让这一档降级为读透缓存：读过的专家留在 pinned 内存，
+后续命中用 H2D 代替 pread。
+
+**第 0 步：先证明"复用"真的存在（零代码，用内核页缓存冒充）**
+
+```sh
+# 本机 PATH 里的 env 是不转发参数的 shim，环境变量一律用 shell 前缀赋值
+export DS4_CUDA_NO_DIRECT_IO=1 DS4_CUDA_KEEP_MODEL_PAGES=1
+./ds4 -m <Q2.gguf> --cuda --ssd-streaming --ssd-streaming-cache-experts 41 \
+      -c 2048 --prefill-chunk 512 --nothink --temp 0 -n 128 -p "<同一 prompt>"
+# 同时后台采样 /proc/<pid>/io 的 read_bytes → 每 token 实际落盘字节
+```
+
+| 组 | 落盘读 | prefill t/s | 解码 t/s |
+|---|---|---|---|
+| A 当前行为（O_DIRECT + 丢弃模型页） | 316.4 GiB | 5.90 | 3.81 |
+| B1 冷页缓存第一遍 | 65.3 GiB | 4.55 | 4.97 |
+| B2 / B3 页缓存已热 = 复用上限 | 0.0 GiB | 10.33 | **6.54** |
+
+B2 相对 A **+72%**（判据是 ≥20% 才动手）。关键数字：每 token 约 2.4 GiB，但 128 token 读掉的
+316 GiB 里唯一字节远少于此——**专家访问是高度偏斜的**，不是均匀分布。
+
+**做法**
+
+- gate/up/down 各一个 arena，条目按文件偏移索引，`cudaHostAlloc` 按约 1 GiB 分块
+  （几万次小 pinned 分配会先撞 `vm.max_map_count`），CLOCK 二次机会淘汰。
+- 命中取引用，引用在**唯一无条件执行点**释放：前台路径是
+  `cuda_stream_copy_requests` 末尾那次 `cudaStreamSynchronize` 之后（含中止批次），
+  预读路径是 `prefetch_finish` 里 join 之后。漏收一处引用，条目就永久不可淘汰，
+  缓存会慢慢退化成只读。
+- 填充先独占条目（`state=filling`）→ 锁外 memcpy → 再发布，并发查到的必是完整字节。
+- **填充只发生在"一个 token 自己的路由"这一档**，判据是请求里的专家数 ≤ 8
+  （`DS4_HOST_EXPERT_CACHE_SLOTS` 可调），不是入口函数：DeepSeek 的 decode 与 prefill 走同一个
+  `begin_selected_load`，实测 slot 数分布为 6 × 1240 次（decode）与 12/48（prefill）。
+  prefill 一次扫上千专家，让它填充会把后面 token 要用的热专家冲掉。
+- 预读（整层 look-ahead）只查不填：look-ahead 不是 reuse 的证据。
+
+**实测**（同一 prompt、`--temp 0 -n 128`，Q2，41 槽）
+
+| 缓存预算 | 落盘读 | 解码 t/s |
+|---|---|---|
+| 关 | 316 GiB | 3.86 / 3.84 |
+| 8 GiB | 168 GiB | 5.23 |
+| 16 GiB | 118 GiB | 6.23 |
+| 32 GiB | 84 GiB | 6.30 |
+| 78 GiB（可用内存全给） | 80 GiB | 6.17 |
+| **默认：可用内存的 1/3 = 26.18 GiB** | 89 GiB | **6.29 / 6.32** |
+
+默认预算**不是**能吃多少吃多少：曲线 16–32 GiB 到平台，32 GiB 已 75.7% 命中，
+78 GiB 只多 1.3 个百分点反而略慢（更多 pinned 内存挤压页缓存）。命中率 73.7% 时
+227 GiB 来自内存、81 GiB 仍走盘。四次运行（开/关各两遍）的正文 md5 逐字一致。
+
+**结论**：这条路径的价值全在"削字节"而不是"加管道"——落盘字节 316 → 89 GiB（−72%），
+解码 3.85 → 6.30 t/s（+64%）。剩下 81 GiB 仍走盘，是因为 26 GiB 装不下全部热专家；
+继续加大预算收益极小，要再上一个台阶得靠更小检查点或批处理。
+
+## 5. 2026-09-18 —（评估否决）SSD→内存跨层异步预取
 
 提议："GPU 计算时把路由权重先搬到主机内存"。核算：
 
@@ -139,7 +201,7 @@ NVMe（Fanxiang S910Pro 2TB，`/data` 为 ext4 on nvme1n1p6）、CUDA 13.3。
   一层就要约 420 ms > 263 ms 的 token 预算。
 - 已佐证：读深度 16/24/32 → 3.78 / 2.98 / 2.96 t/s，深度不是瓶颈。
 
-## 5. 被评估否决的其他方向
+## 6. 被评估否决的其他方向
 
 | 方向 | 关键数字 | 结论 |
 |---|---|---|
@@ -147,15 +209,14 @@ NVMe（Fanxiang S910Pro 2TB，`/data` 为 ext4 on nvme1n1p6）、CUDA 13.3。
 | 权重复化/无损压缩 | iq2_xxs 熵 7.94（上限 1.01x）、q2_k 7.81（1.03x）、q8_0 7.68（1.05x）；全部常驻非路由压到熵极限只省约 1 GiB ≈ +0.6% 流量 | 否决；GPU 熵解码几十 GB/s vs HBM 450 GB/s，比不压更慢 |
 | 扩大专家显存缓存 | 工作集约 15360 个专家，逐 token 复用率 ≈ 0 | 无收益 |
 | `--mtp` / `--dspark` | V4.1 CUDA 直接拒绝 | 不适用 |
-| 更大的并发/更深的暂存队列 | 见第 1 节与第 4 节 | 已到平台期，只是多占 pinned 内存 |
+| 更大的并发/更深的暂存队列 | 见第 1 节与第 5 节 | 已到平台期，只是多占 pinned 内存 |
 
-## 6. 下一步目标
+## 7. 下一步目标
 
-见第 0 节的目标清单。唯一处于「计划」状态的一项是**读透式主机专家缓存**，
-完整的时间表、挂钩点、验收标准都在 [PLAN-host-expert-cache.md](PLAN-host-expert-cache.md)
-（已存档、未实施），这里不再复制，避免两处漂移。
+见第 0 节的目标清单。第 0 节里凡是标着「已实现」的，对应的就是
+[PLAN-host-expert-cache.md](PLAN-host-expert-cache.md) 这份计划文档，它已转为实现记录。
 
-## 7. 实用命令速查
+## 8. 实用命令速查
 
 ```sh
 make cuda                                   # 不给 CUDA_ARCH 时自动探测（本机 sm_120）
@@ -169,9 +230,15 @@ make tests/test_cuda_ssd_cache              # 改了 ds4_cuda.cu 必须单独重
 ./ds4 --cuda -m <Q2.gguf> --ssd-streaming --ssd-streaming-cache-experts 41 \
       -c 2048 --prefill-chunk 512 --nothink -n 64
 
-# 限制/关闭内存常驻专家池
+# 限制/关闭内存常驻专家池与读透缓存
 DS4_RAM_RESIDENT_EXPERTS=0 ./ds4 --cuda ...          # 等价于 --ram-resident-experts off
-./ds4 --cuda ... --ram-resident-experts 64GB          # 给池设上限（低于可用额度时才生效）
+./ds4 --cuda ... --ram-resident-experts 64GB          # 给池/缓存设上限（低于可用额度时才生效）
+
+# 读透式主机专家缓存（路由专家装不进内存时自动启用）
+DS4_HOST_EXPERT_CACHE=off ./ds4 --cuda ...            # 关掉，退回纯 SSD
+DS4_HOST_EXPERT_CACHE=48 ./ds4 --cuda ...             # 预算 48 GiB（不能超出可用额度）
+DS4_HOST_EXPERT_CACHE_STATS=1 ./ds4 --cuda ...        # 退出时打印命中率与内存/磁盘字节
+DS4_HOST_EXPERT_CACHE_SLOTS=8 ./ds4 --cuda ...        # 允许填充的"单 token 路由专家数"上限
 
 # 把 token_embd 挪到 pinned 主机内存，腾出约 1.2 GiB 显存（行 gather 类张量专用）
 ./ds4 --cuda ... --host-offload-token-embd
