@@ -28,8 +28,15 @@ NVMe（Fanxiang S910Pro 2TB，`/data` 为 ext4 on nvme1n1p6）、CUDA 13.3。
 **已完成并固化的目标**
 
 - 串行 pread → 滑动窗口并发预取：V4.1 Q2 解码 1.93 → 3.80 t/s（第 1 节）。
-- 每 token 落盘读 → pinned 主机内存直拷：V4 Flash IQ2XXS 解码 7.22 → 13.02 t/s（第 3 节）。
-- 装不进内存时的读透式主机缓存：V4.1 Q2 解码 3.85 → 6.30 t/s（第 4 节）。
+- 每 token 落盘读 → pinned 主机内存直拷：V4 Flash IQ2XXS 解码 7.22 → 13.02 → **15.19 t/s**
+  （装上池之后再把专家槽推到 960，第 3 节与第 9 节）。
+- 装不进内存时的读透式主机缓存：V4.1 Q2 解码 3.85 → 6.30 t/s，GLM 5.3 Flash 3.82 → 6.06 t/s
+  （第 4 节与第 9 节）。
+
+**三条路径现在是同一个天花板**：V4 Flash 已贴住 PCIe（15.19 / 15.6 = 97%），
+V4.1 与 GLM 的有效带宽只有它的一半（数据要绕"盘→staging→H2D"两趟而不是一趟
+pinned→device）。剩下能动的只有两件事：削字节（batch 解码 / 更小检查点），
+或者加内存让后两者也走全常驻（GLM 只差 3.2 GiB，第 9 节）。
 
 **下一个目标**（[计划文档](PLAN-host-expert-cache.md) 已转为实现记录）：批处理解码，
 同批 token 复用同一层的专家权重；以及更小检查点这一最直接的杠杆。
@@ -54,7 +61,8 @@ NVMe（Fanxiang S910Pro 2TB，`/data` 为 ext4 on nvme1n1p6）、CUDA 13.3。
 | 2026-09-17 | （评估）MoE 放 CPU 计算 | ds4 CPU 后端 / llama.cpp / 带宽实测 | CPU 后端 0.06 t/s，上限约 2 倍 | 否决 |
 | 2026-09-18 | 腾出显存 | `--host-offload-token-embd` | 显存 −1.2 GiB，速度不变 | 已实现 |
 | 2026-09-18 | 消灭整块落盘读 | `--ram-resident-experts`（全量常驻 pinned 池） | V4 Flash IQ2XXS：7.22 → **13.02** | 已实现 |
-| 2026-09-19 | 覆盖「装不进内存」的模型 | 读透式主机专家缓存 | V4.1 Q2：3.85 → **6.30** | 已实现 |
+| 2026-09-19 | 覆盖「装不进内存」的模型 | 读透式主机专家缓存 | V4.1 Q2：3.85 → **6.30**；GLM 5.3：3.82 → **6.06** | 已实现 |
+| 2026-09-19 | 把显存专家槽推到卡的极限 | 960 槽（1200+ 会 OOM） | V4 Flash IQ2XXS：13.55 → **15.19** | 已实现 |
 | 2026-09-18 | （评估）SSD→内存跨层预取 | 盘带宽 / 放大倍数核算 | 增益 ≈ 0（解码已在盘带宽上限） | 否决 |
 
 ## 1. 2026-09-17 — 路由专家预取并行化（V4.1 Flash Q2）
@@ -222,13 +230,19 @@ B2 相对 A **+72%**（判据是 ≥20% 才动手）。关键数字：每 token 
 make cuda                                   # 不给 CUDA_ARCH 时自动探测（本机 sm_120）
 make tests/test_cuda_ssd_cache              # 改了 ds4_cuda.cu 必须单独重建测试，否则在跑旧代码
 
-# V4 Flash IQ2XXS（推荐：要扛长 prompt 就用 512 槽）
-./ds4 --cuda -m <IQ2XXS.gguf> --ssd-streaming --ssd-streaming-cache-experts 512 \
-      -c 4096 --prefill-chunk 512 --nothink -n 96
+# V4 Flash IQ2XXS：本机最快 15.19 t/s（960 槽 -c 2048；长 prompt 退回 512 槽 -c 4096）
+./ds4 --cuda -m <IQ2XXS.gguf> --ssd-streaming --ssd-streaming-cache-experts 960 \
+      -c 2048 --prefill-chunk 512 --nothink --temp 0 -n 128 -p "<prompt>"
 
-# V4.1 Flash Q2（41 是槽位数，不是 GB）
+# V4.1 Flash Q2：6.30 t/s（41 是槽位数，不是 GB）
 ./ds4 --cuda -m <Q2.gguf> --ssd-streaming --ssd-streaming-cache-experts 41 \
-      -c 2048 --prefill-chunk 512 --nothink -n 64
+      -c 2048 --prefill-chunk 512 --nothink --temp 0 -n 128 -p "<prompt>"
+
+# GLM 5.3 Flash Q2：6.06 t/s（必须绕开守卫，且不能给 --prefill-chunk）
+DS4_GLM_MEMORY_GUARD=0 ./ds4 --cuda -m <GLM53-Q2.gguf> --ssd-streaming -c 2048 \
+      --nothink --temp 0 -n 128 -p "<prompt>"
+
+# 三模型横评、槽数扫描与上限核算见第 9 节
 
 # 限制/关闭内存常驻专家池与读透缓存
 DS4_RAM_RESIDENT_EXPERTS=0 ./ds4 --cuda ...          # 等价于 --ram-resident-experts off
@@ -254,6 +268,80 @@ DS4_CUDA_EXPERT_READ_DEPTH=8 ./ds4 --cuda ...
 - `--ssd-streaming-cache-experts` 写 `NGB` 会被解析成"再预留两个完整 prefill 层"，
   结果只剩 1 个槽并报 `CUDA SSD cache cannot stage ... experts with system headroom`；要写**槽位数**。
 - 长 prompt 会为"每层 × 每个唯一路由专家"占槽：IQ2XXS 上 799 token 的 prompt 最多只能用 512 槽，
-  960 槽会 `gpu layer 33 ffn batch encode failed`；短 prompt 压测才能推到 960（约 9.2 t/s 上限）。
+  960 槽会 `gpu layer 33 ffn batch encode failed`；短 prompt 才能推到 960。
+  （9.2 t/s 是常驻池之前的旧上限；装上池之后 960 槽是 15.19 t/s，见第 9 节。）
 - 默认采样不确定：只有 `--temp 0` 的前后对比才有意义。
 - `tests/test_cuda_ssd_cache` 在预取池出错时表现为**卡死**而不是报错，约 5 秒的回归比基准更早发现问题。
+- `ds4` 有单实例锁（`/tmp/ds4.lock`），脚本里连着跑多组要用 `flock -n /tmp/ds4.lock` 先拿到锁。
+
+## 9. 2026-09-19 — 三个模型的横评与上限
+
+**问法**：同一台机器、同一 prompt、`--temp 0 -n 128`，三个模型各自能跑多快，瓶颈分别在哪。
+
+**实测**（RTX 5060 Ti 16 GiB，93 GiB 内存）
+
+| 模型 | GGUF | 路由专家 | 走的路径 | 缓存 off | **最快** | 每 token 字节 |
+|---|---|---|---|---|---|---|
+| V4 Flash IQ2XXS | 80.76 GiB | 72.56 GiB | 全量常驻池 | — | **15.19 t/s** | 1.83 GB |
+| V4.1 Flash Q2 | 340.60 GiB | 142.38 GiB | 读透缓存（装不下） | 3.85 | **6.30 t/s** | 2.65 GB |
+| GLM 5.3 Flash Q2 | 89.88 GiB | 81.63 GiB | 读透缓存（差 3.2 GiB） | 3.82 | **6.06 t/s** | 2.61 GB |
+
+**V4 Flash 的专家槽扫描**（常驻池已装下全部 72.56 GiB，盘已出局）
+
+| 槽数 | 显存 | 解码 t/s |
+|---|---|---|
+| 256 | 1.69 GiB | 11.76 |
+| 512 | 3.38 GiB | 13.55 |
+| **960** | 6.32 GiB | **15.19** |
+| 1200 / 1500 / 2000 | — | OOM（`q8_hc_expand` arena 分配失败） |
+
+槽越多越快：相邻层和相邻 token 会选到同一批专家，槽里已有的就不必再走一次 PCIe。
+960 是这张卡的极限。
+
+**上限核算**：每 token 字节 ÷ 搬运带宽
+
+| 模型 | 每 token | 实测 | 有效带宽 | 全常驻时的 PCIe 天花板 |
+|---|---|---|---|---|
+| V4 Flash | 1.83 GB | 15.19 t/s | **27.8 GB/s** | 15.6 t/s（已达 97%） |
+| V4.1 Flash | 2.65 GB | 6.30 t/s | 15.8 GB/s | 10.8 t/s |
+| GLM 5.3 Flash | 2.61 GB | 6.06 t/s | 15.8 GB/s | 11.0 t/s |
+
+- **V4 Flash 已贴死 PCIe**：`1.83 GB ÷ 28.6 GB/s = 64 ms` → 15.6 t/s，实测 15.19 是它的 97%。
+  再快只能削字节（batch 解码）或加卡做 TP。
+- **V4.1 / GLM 都只有 15.8 GB/s，而它们的落盘只剩 0.7–0.8 GiB/token（折算约 5 GB/s，
+  远低于盘上限）——盘已经不是它们的瓶颈**。慢的原因是数据要绕两趟：
+  未命中 pread→staging→H2D，命中 pinned→H2D，两条路串行叠加，有效带宽只有 PCIe 的一半。
+- 所以差距不在模型，在内存：V4.1/GLM 每 token 字节只比 V4 Flash 多 45%，速度却只有 40%。
+
+**加内存能换到什么**（reserve 上限 16 GiB）
+
+| 模型 | 全常驻所需可用内存 | 需要多大的机器 | 预计速度 |
+|---|---|---|---|
+| GLM 5.3 Flash | 81.63 + 11.68 = 93.31 GiB | 128 GB（本机 93 GiB 只差 3 GiB） | 6.06 → **~11 t/s** |
+| V4.1 Flash | 142.38 + 16 = 158.4 GiB | 192 GB 级 | 6.30 → **~10.8 t/s** |
+
+GLM 的投入产出比最高：只差 3.2 GiB，加一条内存就能把盘整个踢出解码关键路径。
+本机数学上不可能——`MemAvailable` 最大 90 GiB，而 GLM 需要 93.31 GiB。
+
+**本机推荐参数**
+
+```sh
+# V4 Flash IQ2XXS：15.19 t/s（960 槽；要扛长 prompt 就退回 512 槽 + -c 4096）
+./ds4 --cuda -m <IQ2XXS.gguf> --ssd-streaming --ssd-streaming-cache-experts 960 \
+      -c 2048 --prefill-chunk 512 --nothink --temp 0 -n 128 -p "<prompt>"
+
+# V4.1 Flash Q2：6.30 t/s（41 是槽位数，不是 GB）
+./ds4 --cuda -m <V4.1-Q2.gguf> --ssd-streaming --ssd-streaming-cache-experts 41 \
+      -c 2048 --prefill-chunk 512 --nothink --temp 0 -n 128 -p "<prompt>"
+
+# GLM 5.3 Flash Q2：6.06 t/s（两个坑见下）
+DS4_GLM_MEMORY_GUARD=0 ./ds4 --cuda -m <GLM53-Q2.gguf> --ssd-streaming -c 2048 \
+      --nothink --temp 0 -n 128 -p "<prompt>"
+```
+
+**GLM 在本机的两个坑**
+
+- 不加 `DS4_GLM_MEMORY_GUARD=0` 会被守卫拒掉：它要预留 32 GiB，16 GiB 卡上预算直接算成 0
+  （`GLM memory guard refused ctx=2048 ... reserve 32.00 GiB`）。
+- **不接受 `--prefill-chunk`**（"GLM uses graph-selected prefill chunks"）；`-c` 大小对速度无影响
+  （512 与 2048 都是 6.06–6.09 t/s）。
